@@ -1,180 +1,137 @@
 # pi-hand-off
 
-A [pi](https://github.com/earendil-works/pi) extension with two commands:
+Keep working in a fresh [pi](https://github.com/earendil-works/pi) session without having to explain the task again. **pi-hand-off** writes a hand-off prompt from your conversation and lets you choose the model that picks up the work.
 
-- `/hand-off` — hand the conversation to another model with a prompt written by the current agent, or by a cheap one-off "fresh pass"
-- `/hand-off-relay` — let agents hand off to each other on their own, with a step and cost limit
+Use it when a conversation has grown long, when you want another model to take over, or when you're returning to an old task. You can review each hand-off yourself, or let agents continue through a bounded relay.
 
-This package was split out of [`@grrrck/pi-clear`](https://github.com/gadenbuie/pi-clear), which now only provides `/clear`. If you used `/hand-off` or `/hand-off-chain` from there, see [Moving from pi-clear](#moving-from-pi-clear).
-
-## Why?
-
-Pi's built-in `/new` command starts a new session, but the new session resolves its model from pi's defaults chain — CLI arguments, scoped models, the saved default in settings, then the first available model with auth. A model you switched to mid-session is lost.
-
-`/hand-off` lets you choose the next model and thinking level (or keep the current ones) and carries a written summary of the work into the fresh session.
+| Command | Use it when… |
+| --- | --- |
+| `/hand-off` | You want a fresh session with a prompt you can review and edit before continuing. |
+| `/hand-off-relay` | You want agents to keep handing off work without reviewing every transition. |
 
 ## Install
+
+Install into pi:
 
 ```sh
 pi install npm:@grrrck/pi-hand-off
 ```
 
-Or try it without installing:
+Or try it for one pi run without installing:
 
 ```sh
 pi -e npm:@grrrck/pi-hand-off
 ```
 
-To install straight from GitHub instead of npm (the latest `main`, or pin a tag or commit after `@`):
+## Hand off a conversation
 
-```sh
-pi install git:github.com/gadenbuie/pi-hand-off
-pi install git:github.com/gadenbuie/pi-hand-off@main
-```
-
-## Usage
+To carry the current work into a fresh session, run:
 
 ```text
-/hand-off [--fresh | --live] [--same] [steering instructions]
-/hand-off-relay --max-steps <N> [--max-cost USD] [task]
-/hand-off-relay <off | status | resume>
+/hand-off
 ```
 
-## `/hand-off` behavior
+You'll choose who writes the hand-off prompt, then keep your current model and thinking level or pick different ones for the next session. You can also give instructions about what to carry forward or focus on next.
 
-When `/hand-off` runs, the extension:
+The extension writes the prompt and opens a new session with it in the editor. **Nothing is submitted automatically:** review the prompt, edit it if needed, and send it when you're ready. Cancelling a dialog leaves you in the current session; if prompt generation fails, the extension reports why and stays there too.
 
-0. **chooses who writes the hand-off prompt** — see [Choosing the writer](#choosing-the-writer). The picker is skipped when `--fresh` or `--live` was passed
-1. waits for the agent to become idle if needed
-2. asks whether the next session keeps the current model and thinking level — the first option, so pressing Enter keeps them — or opens a model picker, then a thinking level picker, then collects steering instructions: text you typed after `/hand-off` (and its flags) is used as-is, and the steering editor only opens when you passed none. `--same` skips the same-or-pick dialog and re-uses the current model and thinking level. The model picker respects your session's model scoping (`--models` / `enabledModels`, the same set `/scoped-models` shows) and offers a Tab toggle between scoped and all models. In non-TUI modes it falls back to plain dialogs: the scoped list when configured, otherwise a two-level provider → model pick so the dialog never floods the screen
-3. writes the hand-off prompt with the chosen writer — the live agent, or a single off-screen model call over a minimal reconstruction of the conversation
-4. prepends a provenance comment naming the source session, starts a new session, applies the model and thinking level you picked, and inserts the prompt into the editor via `ctx.ui.setEditorText()`
-5. stops there: the prompt sits in the editor for you to review, edit, and submit yourself
+For example, after exploring a bug, you might ask the next agent to focus on a fix:
 
-Cancelling any dialog aborts the hand-off before anything is sent. If the writer doesn't produce a prompt, the extension stays in the current session and reports why.
-
-On the live-agent path the request itself is recorded in the current session's transcript; either way, the hand-off prompt sits in the new session's editor — it becomes the first user message once you review and submit it.
-
-One limitation worth knowing: on the live-agent path, if you queue another message while the agent is writing the hand-off prompt, the capture may pick up the wrong response — avoid queueing during generation.
-
-### Choosing the writer
-
-There is deliberately no configured default: which writer to use depends on the conversation in front of you, so `/hand-off` asks every time.
-
-| Writer | How it writes the prompt |
-|---|---|
-| **This agent — full context and tools** (first, so Enter keeps the old behavior) | The current agent writes its next message as the hand-off prompt. It sees the whole transcript and keeps its tools. |
-| **Fresh pass — current model** | One out-of-band `modelRegistry.complete()` call over a *minimal reconstruction* of the conversation: your messages, the assistant's visible text, and one-line hints for tool calls. No tool output, no thinking, and a head+tail character budget. **No tool access.** |
-| **Fresh pass — another model…** | Same, but you pick the model that writes the prompt first (a cheap, fast model is a good choice). |
-
-The fresh pass exists because the live agent's prompt inherits the session's whole context window: an old or long conversation may no longer fit, and a session whose model lost auth can still be handed off. Because it never reads tool output, it is told to have the next agent verify anything it cannot see in the transcript.
-
-When the writer model supports reasoning, the fresh pass also asks for its **thinking level**, with **provider default** preselected — so pressing Enter passes straight through. Set a standing preference with `handoff.summarizerThinkingLevel` in the config file; the picker then preselects that level instead, and the level is passed to the model as `reasoning`. Models without reasoning controls skip the dialog entirely.
-
-Fresh pass flags and limits:
-
-- `--fresh` skips the writer picker and uses the fresh pass; `--live` skips it and uses the current agent. Passing both is refused before any dialog opens.
-- `--same` skips the same-or-pick dialog and re-uses the current session's model and thinking level. It combines freely with `--fresh` / `--live` and inline steering.
-- Flags are only recognized at the front of the command args: `/hand-off --same fix the tests` parses the flag, but `/hand-off fix the tests --same` passes `--same` through as steering text. Anything after the first non-flag token is steering.
-- There is no command-arg model flag: if you want a specific model to write the prompt, set it in the [config file](#configuration) (or pick it from the menu).
-- The source is the post-compaction view of the session, so a compacted conversation is summarized from its summary rather than from nothing.
-- Trimming keeps the opening message, the newest turns, and a contiguous run after the opening message; the middle is replaced by `[... <n> turns omitted — <k> chars ...]` and you get a notification saying how much was dropped. Raise the budget with the settings below if that happens.
-
-### Session provenance
-
-Every hand-off prompt (from either writer) starts with a comment naming the session it came from:
-
-```markdown
-<!-- Handed off from pi session 01a18da2-4eff-73b9-846d-5fd4c156e52e -->
+```text
+/hand-off Focus on the failing tests and the smallest fix. Leave the refactor for later.
 ```
 
-It's a comment, so it doesn't read as part of the task and stays visible in the editor for you to check. The extension adds it after the prompt is written, so the writing model can't reword or drop it.
+Unlike starting an empty session with `/new`, a hand-off carries a written account of the work forward and explicitly preserves or changes your model and thinking level. It doesn't copy the whole conversation into the next session.
 
-When the conversation is stale, the comment also says when it was last active (UTC, with the gap): always for the fresh pass, and for the live agent when the conversation had been idle for an hour or more.
+### Choose who writes the prompt
 
-### Authority note
+The model that writes the prompt doesn't have to be the model that continues the work.
 
-The extension also appends a short note to every `/hand-off` prompt (not to relay hops): the previous agent's plan, hypotheses, and next steps are a starting point, not instructions; what the user stated as requirements and preferences does bind; trust what you can verify, and ask the user only when blocked or when something conflicts with what they said. It guards against the receiving agent treating incidental details of the prompt as constraints. For a stale conversation it adds that the project may have changed and the agent should establish current state before acting. It's plain text at the end of the editor, so you can edit or delete it.
+- **This agent — full context and tools:** the current agent writes from its conversation, with tool access. Use this when you want it to draw on the work it has already done.
+- **Fresh pass — current model:** a separate call writes from a shortened transcript, without tool access.
+- **Fresh pass — another model…:** the same fresh pass, using a model you choose. A cheaper model can write the summary while a different model handles the next task.
 
-Both writers are also asked to say how you've been working (delegation, review, commit and communication habits you stated), to mark what you required as binding and their own inferences as suggestions, and to name branches, commits, or results only if they saw them. Neither writer gets a section template.
+A fresh pass is useful when the live agent's context has grown too large, or its model is no longer available and you can use another one. It sees your messages, the assistant's visible text, and brief hints about tool calls, **not tool results or private reasoning**. Long conversations may be trimmed; pi notifies you when this happens. Review the prompt for missing details, especially test results or facts that appeared only in tool output.
 
-The fresh pass has no tools on purpose: it describes a past conversation, in the past tense, and the agent picking up the hand-off checks the current state itself.
+For reasoning-capable fresh-pass models, you also choose the writer's thinking level. This is separate from the next session's thinking level.
 
-## Autonomous relays
+### Shortcuts
 
-Long plans outgrow one context window. `/hand-off-relay` lets a run keep going without you: when an agent finishes its part, it hands off to a fresh agent, which picks up where it left off, until the work is done, something goes wrong, or a limit you set is reached.
+To skip the model-choice dialog and keep your current model and thinking level:
 
-It's off unless you run it. Use `/hand-off` when you want to review each hand-off yourself.
+```text
+/hand-off --same
+```
 
-### Quick start
+To skip the writer dialog as well, use `--fresh` or `--live`:
+
+```text
+/hand-off --fresh --same Continue with the next unchecked item in PLAN.md.
+/hand-off --live Ask the next agent to review the approach before changing code.
+```
+
+Put flags before your instructions. `--fresh` and `--live` cannot be combined. If you leave out instructions, an editor opens so you can add them. When picking a model, the list respects your pi model scope; press Tab to switch between scoped and all models.
+
+### What carries forward
+
+The prompt asks the writer to preserve your requirements, preferences, working habits, progress, and next steps. It includes the source session ID so you can trace it back. For fresh passes and stale conversations, it also notes when the conversation was last active.
+
+An editable note reminds the receiving agent that your stated requirements matter, but the previous agent's plan and guesses are starting points to verify, not new constraints. A hand-off is still a model-written summary: check it before relying on it.
+
+On the live-agent path, avoid queueing another message while the prompt is being written; that can cause the wrong response to be captured.
+
+## Let agents continue in a relay
+
+A **relay** starts a fresh session whenever an agent hands off its part of the work. Use one for a task that can be split into steps, with progress recorded somewhere each new agent can find it.
+
+For example, to work through a plan with a hand-off limit and a spending limit:
 
 ```text
 /hand-off-relay --max-steps 8 --max-cost 5 Do the next unchecked item in PLAN.md, run the tests, tick it off, and commit.
 ```
 
-That arms a relay of up to 8 hand-offs (`--max-steps`), with a $5 limit. The agent you're talking to is step 0 and isn't counted, so the relay can run up to 9 agents. Your task goes to the current agent. Each new agent starts fresh and sees only the previous agent's hand-off plus whatever is on disk, so the task should say where progress is tracked, such as a plan file with checkboxes or the git log.
+This allows up to **8 hand-offs**, or 9 agents including the current one, with a $5 cost limit. All sessions use the model and thinking level you started with. Each new agent receives the previous agent's hand-off, not the full conversation, so name the plan file or other place where progress is tracked.
 
-If you leave the task out, the relay is armed and waits; type your task as your next message.
+If you omit the task, the relay waits for your next message. Relays are off unless you explicitly start one.
 
-Every agent runs with your full tool access and nobody watches live, so run relays in a repo you can recover, and set `--max-cost`. Every session uses the model and thinking level you started with.
+**Agents keep your full tool access and continue without your review at each hand-off.** Use a repository you can recover, give clear task boundaries, and set a cost limit. A spending limit is not a sandbox or a guarantee that the task will succeed.
 
-### How an agent ends
+### Check, pause, and stop
 
-Each agent is told how to finish. Its entire final message is one of:
+Use these commands while a relay is armed:
 
-- `<hand-off>…</hand-off>`: what it did, what's next, and any gotchas. The next session starts from this.
-- `<hand-off done/>`: the work is complete.
-- `<hand-off pause>question</hand-off>`: it needs an answer from you. The relay waits in that session; reply there and it carries on when the agent finishes.
-- `<hand-off stop>reason</hand-off>`: it can't continue (blocked, tests failing). The relay ends and you see the reason.
+```text
+/hand-off-relay status
+/hand-off-relay off
+```
 
-If an agent forgets the tag, it gets one reminder before the relay gives up.
+`status` shows the current step, spending, and sessions. `off` disarms the relay.
 
-### Cost limit
+The relay stops when the work is complete, an agent reports it cannot continue, a limit is reached, or a run is aborted or fails to finish cleanly. If an agent needs your answer, the relay pauses in that session; reply there to let it continue. You get a notification when the relay stops, including the reason and total reported cost. You can revisit its sessions with pi's `/resume` command.
 
-`--max-cost` takes dollars and goes before your task. As spending nears the limit, the agent is nudged to wrap up:
+### Spending limits
 
-| Spent | What the agent is told |
-| --- | --- |
-| 80% | Heads-up: plan to wrap up soon. |
-| 95% | Stop now: finish only the final tasks and leave things consistent. |
-| 98% | Out of budget: write a final status summary. |
-| 100% | The session is aborted and the relay stops. |
+With `--max-cost`, agents are nudged after tool turns as reported spending crosses 80% of the budget (prepare to wrap up), 95% (finish remaining tasks), and 98% (write a final summary). The relay won't start another session at or above 95%; at 100%, it aborts the run.
 
-Past 95%, the relay won't start a new session. Costs are only known after each model call, so one expensive turn can overshoot, and models that don't report cost can't be limited this way. Without `--max-cost` there is no limit.
+**The limit can be exceeded:** costs are reported after model calls, so one expensive call can overshoot. Models that don't report cost cannot be limited this way. Without `--max-cost`, there is no spending limit.
 
-### When it stops
+### Resume after quitting or a crash
 
-You get a notification with the reason and the total spent. A relay stops when:
+Relay progress is saved locally. When you next start pi in the same working directory, it tells you if a relay was interrupted. To continue it, run:
 
-- an agent signals `done` or `stop` (a `pause` waits for you instead);
-- the last allowed agent asks for another hand-off;
-- the cost limit is hit;
-- you abort a run, or an agent fails to finish cleanly;
-- an agent ignores the reminder to end with a tag.
+```text
+/hand-off-relay resume
+```
 
-### Checking on it
+If the interruption happened between agents, the next session starts from the saved hand-off. If it happened during a step, first open that session with `/resume`, then run `/hand-off-relay resume`. Use `/hand-off-relay off` to discard an interrupted relay instead.
 
-- `/hand-off-relay status` shows the current step, spend so far, and the sessions in the relay.
-- `/hand-off-relay off` disarms it.
+Only one relay can run per working directory. If another pi process owns it, `status` identifies that process and you can't resume, discard, or replace its relay until that process stops.
 
-Each session the relay leaves records its model, tokens, and cost, and a relay that stops records why in the session it stopped in, and every session after the first begins with a comment naming the step and the session it came from. You can resume any of them with `/resume`.
+Saved relay files live in `<agent-dir>/pi-hand-off/relays/` and are removed when the relay stops. They include hand-off text, which may contain details from your task.
 
-A relay runs inside the pi process, and each process can run one relay at a time. Starting a new session yourself doesn't disturb it.
+## Optional configuration
 
-### Resuming an interrupted relay
-
-The relay's progress is saved to `<agent-dir>/pi-hand-off/relays/`, one file per working directory, and deleted when the relay stops. If pi crashes or you quit mid-relay, the next pi you start in that directory tells you the relay was interrupted:
-
-- `/hand-off-relay resume` continues it. If the interruption came between two agents, the next session starts from the saved hand-off; if it came mid-step, open that session with `/resume` first and run `resume` there, and the agent is asked to pick up where it left off.
-- `/hand-off-relay off` discards it.
-
-Only one relay can run per working directory. The saved file records the pi process that owns it, so a second pi in the same directory is not confused by it: it shows no "interrupted" warning, `/hand-off-relay status` says the relay is running in another process (with its pid), and `resume`, `off` and arming a second relay are refused until that process stops. You can still use other pi sessions in that directory for anything else, including a different task that happens not to be a relay. A file whose process has exited is treated as interrupted. The file also records the owner's start time, so an unrelated process that later reuses the pid isn't mistaken for it. If `ps` can't report a start time (for example on Windows), only the pid is checked, and a reused pid can then make a dead relay look alive; delete the file under `<agent-dir>/pi-hand-off/relays/` if that happens.
-
-The saved file holds the step count, spend, session IDs, and the pending hand-off text, so it can contain whatever the agent wrote there.
-
-## Configuration
-
-Optional settings live in `<agent-dir>/pi-hand-off.json` (`~/.pi/agent`, or `$PI_CODING_AGENT_DIR`), read once per session:
+You don't need a config file. To set preferences for fresh-pass writing, create `~/.pi/agent/pi-hand-off.json` (or `pi-hand-off.json` in your custom `$PI_CODING_AGENT_DIR`):
 
 ```json
 {
@@ -187,56 +144,42 @@ Optional settings live in `<agent-dir>/pi-hand-off.json` (`~/.pi/agent`, or `$PI
 }
 ```
 
-- `summarizerModel` — preselected in the writer-model picker, and offered as its own `Fresh pass — <model>` entry in the writer picker.
-- `askSummarizerModel: false` — with `summarizerModel` set, skip the writer-model picker entirely and always use that model.
-- `summarizerThinkingLevel` — preselected in the writer's thinking-level picker: `"default"` (or `"off"`) for the provider default, otherwise `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. The dialog stays available either way.
-- `maxSourceChars` — characters of conversation sent to the fresh pass (default `200000`, about 50k tokens). `0` disables the budget.
+Choose a `summarizerModel` you have configured in pi. These settings affect the **writer**, not the model that takes over:
 
-A malformed file is reported as a warning and ignored. The same knobs are available per pi launch as CLI flags:
+| Setting | Effect |
+| --- | --- |
+| `summarizerModel` | Preferred fresh-pass model; offered in the writer menu and preselected in the writer-model picker. |
+| `askSummarizerModel` | Set to `false` with a `summarizerModel` to skip the fresh-pass model picker and use that model. It does not skip the live-or-fresh writer menu. |
+| `summarizerThinkingLevel` | Preselected writer thinking level. Use `default` (or `off`) for the provider default, or `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. The picker remains available for reasoning-capable models. |
+| `maxSourceChars` | Fresh-pass transcript budget in characters. Defaults to `200000`; `0` disables trimming. |
+
+Settings are read at the start of each session. Invalid configuration is reported as a warning and ignored. To override the writer model or transcript budget for a pi run:
 
 ```sh
 pi --hand-off-summarizer=anthropic/claude-haiku-4-5 --hand-off-max-source-chars=400000
 ```
 
-Precedence: pi CLI flag > config file > built-in default. On the command line, only the writer choice (`--fresh` / `--live`) is available — a model ID belongs in the config file or the picker.
+Launch flags override the config file. Setting `--hand-off-summarizer` also skips the fresh-pass model picker. If your preferred writer model isn't available, pi warns you and asks you to choose another. `/hand-off` itself has no model-ID flag; use the pickers or configuration.
 
 ## Moving from pi-clear
 
-- `/hand-off-chain` is now `/hand-off-relay`; the old name was never released to npm.
-- Settings move from `<agent-dir>/pi-clear.json` to `<agent-dir>/pi-hand-off.json`. If the new file doesn't exist, the old one is still read, so nothing breaks; rename it when convenient.
-- Install both packages if you want `/clear` too: `pi install npm:@grrrck/pi-clear`.
+This extension was split out of [`@grrrck/pi-clear`](https://github.com/gadenbuie/pi-clear), which provides `/clear`: a fresh session that keeps your model without carrying a hand-off prompt.
 
-## How it works
+- Install `pi-hand-off` for `/hand-off` and `/hand-off-relay`. Keep `pi-clear` installed if you also want `/clear`.
+- Rename `<agent-dir>/pi-clear.json` to `<agent-dir>/pi-hand-off.json` when convenient. The old file is still read if the new one doesn't exist.
+- If you used the unreleased `/hand-off-chain` command, use `/hand-off-relay` instead.
 
-pi tears down the current runtime when a session is replaced, and extension instances are recreated for the new session. Session-bound objects can't be reused across that boundary, and the post-switch context has no model setter — but the replacement happens within the same process. So both commands capture state as plain data in a `globalThis` property, and the new session's extension instance consumes it on `session_start` (reason `new`) and applies it with `pi.setModel()` (plus `ctx.ui.setEditorText()` for the hand-off prompt). The handoff is consumed exactly once, so it can never leak into a later session.
+## Contributing
 
-`/hand-off` captures the live agent's response by watching the `agent_end` event while the hand-off request is in flight, using per-instance state that dies with the session — only the final payload crosses into the new session via `globalThis`.
-
-The fresh pass never sends a message to the agent at all: it calls `ctx.modelRegistry.complete()` once with a system prompt and a single user message built from `buildSessionProjection().messages`, runs the reply through the same validation as the live path (`stopReason === "stop"`, non-empty, surrounding fences stripped), and carries the result across the same `globalThis` handoff.
-
-## Development
-
-Load the extension directly for local testing:
+Load a local checkout with `pi -e ./index.ts`. Run the offline tests with:
 
 ```sh
-pi -e ./index.ts
+for f in scripts/*.test.mjs; do node "$f"; done
 ```
 
-There are also smoke tests that verify the behavior end-to-end by starting pi in RPC mode:
+The separate `scripts/rpc-handoff-smoke-test.py` uses your live pi configuration and makes real, billed model requests. Run it only when you intend to test against those models.
 
-```sh
-python3 scripts/rpc-handoff-smoke-test.py  # /hand-off, both writers, dialogs included
-node --test scripts/model-picker.test.mjs          # offline: model picker behavior
-node --test scripts/minimal-transcript.test.mjs    # offline: fresh-pass transcript + budget
-node --test scripts/fresh-pass-flow.test.mjs       # offline: /hand-off flow, both writers
-node --test scripts/relay.test.mjs                 # offline: relay decisions, parsing, persistence
-```
-
-The RPC smoke test needs at least two models with configured auth and makes **real, billed model requests** (the agent writes the hand-off prompt). The `node --test` scripts need neither auth nor a pi process.
-
-## Related extensions
-
-- [`@grrrck/pi-clear`](https://github.com/gadenbuie/pi-clear) — `/clear`: a fresh session that keeps your model
+Bug reports and pull requests are welcome on [GitHub](https://github.com/gadenbuie/pi-hand-off/issues).
 
 ## License
 
