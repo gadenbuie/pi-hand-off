@@ -25,6 +25,13 @@ Or try it without installing:
 pi -e npm:@grrrck/pi-hand-off
 ```
 
+To install straight from GitHub instead of npm (the latest `main`, or pin a tag or commit after `@`):
+
+```sh
+pi install git:github.com/gadenbuie/pi-hand-off
+pi install git:github.com/gadenbuie/pi-hand-off@main
+```
+
 ## Usage
 
 ```text
