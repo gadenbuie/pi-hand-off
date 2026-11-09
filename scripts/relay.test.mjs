@@ -23,16 +23,18 @@ import {
 } from "../index.ts";
 
 test("parseRelayArgs", () => {
-	assert.deepEqual(parseRelayArgs("10 do PLAN.md"), { kind: "start", maxSteps: 10, maxCost: undefined, task: "do PLAN.md" });
-	assert.deepEqual(parseRelayArgs("3"), { kind: "start", maxSteps: 3, maxCost: undefined, task: "" });
+	assert.deepEqual(parseRelayArgs("--max-steps 10 do PLAN.md"), { kind: "start", maxSteps: 10, maxCost: undefined, task: "do PLAN.md" });
+	assert.deepEqual(parseRelayArgs("--max-steps=3"), { kind: "start", maxSteps: 3, maxCost: undefined, task: "" });
 	assert.deepEqual(parseRelayArgs("off"), { kind: "off" });
 	assert.deepEqual(parseRelayArgs("status"), { kind: "status" });
 	assert.deepEqual(parseRelayArgs(""), { kind: "status" });
-	assert.deepEqual(parseRelayArgs("5 --max-cost 2.5 go"), { kind: "start", maxSteps: 5, maxCost: 2.5, task: "go" });
-	assert.deepEqual(parseRelayArgs("5 --max-cost=$3"), { kind: "start", maxSteps: 5, maxCost: 3, task: "" });
+	assert.deepEqual(parseRelayArgs("--max-steps 5 --max-cost 2.5 go"), { kind: "start", maxSteps: 5, maxCost: 2.5, task: "go" });
+	assert.deepEqual(parseRelayArgs("--max-cost=$3 --max-steps=5"), { kind: "start", maxSteps: 5, maxCost: 3, task: "" });
 	// Flags only count before the task.
-	assert.deepEqual(parseRelayArgs("5 go --max-cost 2"), { kind: "start", maxSteps: 5, maxCost: undefined, task: "go --max-cost 2" });
-	for (const bad of ["0", "x", "-2", "--relay 3", "5 --max-cost", "5 --max-cost 0", "5 --max-cost abc", "5 --max-cost=-1"]) {
+	assert.deepEqual(parseRelayArgs("--max-steps 5 go --max-cost 2"), { kind: "start", maxSteps: 5, maxCost: undefined, task: "go --max-cost 2" });
+	assert.deepEqual(parseRelayArgs("--max-steps 5 go --max-steps 9"), { kind: "start", maxSteps: 5, maxCost: undefined, task: "go --max-steps 9" });
+	// --max-steps is required; a bare number is no longer accepted.
+	for (const bad of ["5", "5 go", "go", "--max-cost 2 go", "--max-steps", "--max-steps 0", "--max-steps x", "--max-steps -2", "--max-steps 1.5", "--max-steps 5 --max-cost", "--max-steps 5 --max-cost 0", "--max-steps 5 --max-cost abc", "--max-steps 5 --max-cost=-1"]) {
 		assert.equal(parseRelayArgs(bad).kind, "error", bad);
 	}
 });

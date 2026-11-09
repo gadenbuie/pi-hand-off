@@ -34,7 +34,7 @@
  *    thinking level, and inserts the prompt into the editor.
  * 5. The user reviews, edits, and submits the prompt themselves.
  *
- * `/hand-off-relay N [--max-cost USD] [task]`: opt-in autonomous relay. Arms a run of up to
+ * `/hand-off-relay --max-steps N [--max-cost USD] [task]`: opt-in autonomous relay. Arms a run of up to
  * N hand-offs: the current agent is step 0 and not counted, so up to N+1 sessions. Each agent ends its work with a final
  * message that is exactly one `<hand-off>…</hand-off>` block; on
  * `agent_settled` the extension extracts it and replaces the session through
@@ -1185,7 +1185,7 @@ async function chooseWriter(ctx: ExtensionContext, options: WriterOptions): Prom
 }
 
 // ============================================================================
-// Autonomous relay (`/hand-off-relay N`)
+// Autonomous relay (`/hand-off-relay --max-steps N`)
 // ============================================================================
 
 /**
@@ -1386,37 +1386,54 @@ export type RelayArgs =
 	| { kind: "resume" }
 	| { kind: "error"; error: string };
 
-const RELAY_USAGE = "/hand-off-relay needs a positive number of hand-offs, or `off` / `status` / `resume`";
+const RELAY_USAGE =
+	"/hand-off-relay needs `--max-steps N` (the number of hand-offs; the agent you start in is step 0 and not counted), or `off` / `status` / `resume`";
+
+/** Value of `--name V` or `--name=V` at `tokens[i]`, and how many tokens it used. */
+function flagValue(tokens: string[], i: number, name: string): { raw: string | undefined; used: number } | undefined {
+	const token = tokens[i];
+	if (token === name) return { raw: tokens[i + 1], used: 2 };
+	if (token.startsWith(`${name}=`)) return { raw: token.slice(name.length + 1), used: 1 };
+	return undefined;
+}
 
 /**
- * Parse `<N|off|status> [--max-cost USD] [task text]`; no arguments means
- * `status`. Like `/hand-off`, flags are only recognized before the task.
+ * Parse `--max-steps N [--max-cost USD] [task text]`, or `off` / `status` /
+ * `resume`; no arguments means `status`. Like `/hand-off`, flags are only
+ * recognized before the task, in any order.
  */
 export function parseRelayArgs(args: string): RelayArgs {
 	const tokens = args.split(/\s+/).filter(Boolean);
-	const value = tokens[0];
-	if (value === undefined || value === "status") return { kind: "status" };
-	if (value === "off") return { kind: "off" };
-	if (value === "resume") return { kind: "resume" };
-	if (!/^\d+$/.test(value) || Number(value) < 1) return { kind: "error", error: RELAY_USAGE };
+	const first = tokens[0];
+	if (first === undefined || first === "status") return { kind: "status" };
+	if (first === "off") return { kind: "off" };
+	if (first === "resume") return { kind: "resume" };
 
+	let maxSteps: number | undefined;
 	let maxCost: number | undefined;
-	let i = 1;
+	let i = 0;
 	while (i < tokens.length) {
-		const token = tokens[i];
-		let raw: string | undefined;
-		if (token === "--max-cost") {
-			raw = tokens[i + 1];
-			i += 2;
-		} else if (token.startsWith("--max-cost=")) {
-			raw = token.slice("--max-cost=".length);
-			i += 1;
-		} else break;
-		const amount = raw !== undefined && /^\$?\d+(\.\d+)?$/.test(raw) ? Number(raw.replace("$", "")) : NaN;
-		if (!(amount > 0)) return { kind: "error", error: "--max-cost needs a positive dollar amount, e.g. --max-cost 5" };
-		maxCost = amount;
+		const steps = flagValue(tokens, i, "--max-steps");
+		if (steps) {
+			if (steps.raw === undefined || !/^\d+$/.test(steps.raw) || Number(steps.raw) < 1) {
+				return { kind: "error", error: "--max-steps needs a positive whole number, e.g. --max-steps 8" };
+			}
+			maxSteps = Number(steps.raw);
+			i += steps.used;
+			continue;
+		}
+		const cost = flagValue(tokens, i, "--max-cost");
+		if (cost) {
+			const amount = cost.raw !== undefined && /^\$?\d+(\.\d+)?$/.test(cost.raw) ? Number(cost.raw.replace("$", "")) : NaN;
+			if (!(amount > 0)) return { kind: "error", error: "--max-cost needs a positive dollar amount, e.g. --max-cost 5" };
+			maxCost = amount;
+			i += cost.used;
+			continue;
+		}
+		break;
 	}
-	return { kind: "start", maxSteps: Number(value), maxCost, task: tokens.slice(i).join(" ") };
+	if (maxSteps === undefined) return { kind: "error", error: RELAY_USAGE };
+	return { kind: "start", maxSteps, maxCost, task: tokens.slice(i).join(" ") };
 }
 
 export type RelaySignal =
@@ -2023,7 +2040,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("hand-off-relay", {
 		description:
-			"Autonomous hand-off relay: /hand-off-relay <N> [task] lets agents hand off to each other for up to N hand-offs (the first agent is step 0); `off` disarms, `status` reports",
+			"Autonomous hand-off relay: /hand-off-relay --max-steps <N> [--max-cost USD] [task] lets agents hand off to each other for up to N hand-offs (the first agent is step 0); `off` disarms, `status` reports, `resume` continues an interrupted relay",
 		handler: async (args, ctx) => handleRelayCommand(args, ctx),
 	});
 

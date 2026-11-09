@@ -29,7 +29,8 @@ pi -e npm:@grrrck/pi-hand-off
 
 ```text
 /hand-off [--fresh | --live] [--same] [steering instructions]
-/hand-off-relay <N | off | status | resume> [--max-cost USD] [task]
+/hand-off-relay --max-steps <N> [--max-cost USD] [task]
+/hand-off-relay <off | status | resume>
 ```
 
 ## `/hand-off` behavior
@@ -91,10 +92,10 @@ It's off unless you run it. Use `/hand-off` when you want to review each hand-of
 ### Quick start
 
 ```text
-/hand-off-relay 8 --max-cost 5 Do the next unchecked item in PLAN.md, run the tests, tick it off, and commit.
+/hand-off-relay --max-steps 8 --max-cost 5 Do the next unchecked item in PLAN.md, run the tests, tick it off, and commit.
 ```
 
-That arms a relay of up to 8 hand-offs, with a $5 limit. The agent you're talking to is step 0 and isn't counted, so the relay can run up to 9 agents. Your task goes to the current agent. Each new agent starts fresh and sees only the previous agent's hand-off plus whatever is on disk, so the task should say where progress is tracked, such as a plan file with checkboxes or the git log.
+That arms a relay of up to 8 hand-offs (`--max-steps`), with a $5 limit. The agent you're talking to is step 0 and isn't counted, so the relay can run up to 9 agents. Your task goes to the current agent. Each new agent starts fresh and sees only the previous agent's hand-off plus whatever is on disk, so the task should say where progress is tracked, such as a plan file with checkboxes or the git log.
 
 If you leave the task out, the relay is armed and waits; type your task as your next message.
 
