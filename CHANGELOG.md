@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-11-09
 
 First release as its own package. `/hand-off` and the relay were split out of [`@grrrck/pi-clear`](https://github.com/gadenbuie/pi-clear) (versions up to 0.5.0), which now only provides `/clear`.
 
