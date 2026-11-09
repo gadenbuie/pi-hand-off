@@ -90,6 +90,16 @@ Every hand-off prompt (from either writer) starts with a comment naming the sess
 
 It's a comment, so it doesn't read as part of the task and stays visible in the editor for you to check. The extension adds it after the prompt is written, so the writing model can't reword or drop it.
 
+When the conversation is stale, the comment also says when it was last active (UTC, with the gap): always for the fresh pass, and for the live agent when the conversation had been idle for an hour or more.
+
+### Authority note
+
+The extension also appends a short note to every `/hand-off` prompt (not to relay hops): the previous agent's plan, hypotheses, and next steps are a starting point, not instructions; what the user stated as requirements and preferences does bind; trust what you can verify, and ask the user only when blocked or when something conflicts with what they said. It guards against the receiving agent treating incidental details of the prompt as constraints. For a stale conversation it adds that the project may have changed and the agent should establish current state before acting. It's plain text at the end of the editor, so you can edit or delete it.
+
+Both writers are also asked to say how you've been working (delegation, review, commit and communication habits you stated), to mark what you required as binding and their own inferences as suggestions, and to name branches, commits, or results only if they saw them. Neither writer gets a section template.
+
+The fresh pass has no tools on purpose: it describes a past conversation, in the past tense, and the agent picking up the hand-off checks the current state itself.
+
 ## Autonomous relays
 
 Long plans outgrow one context window. `/hand-off-relay` lets a run keep going without you: when an agent finishes its part, it hands off to a fresh agent, which picks up where it left off, until the work is done, something goes wrong, or a limit you set is reached.

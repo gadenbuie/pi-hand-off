@@ -267,7 +267,8 @@ test("the request carries the minimal transcript and the steering text", async (
 test("the editor gets the provenance comment and the stripped prompt", async () => {
 	const result = await runHandoff();
 	assert.match(result.editorText, new RegExp(`^<!-- Handed off from pi session ${SESSION_ID} -->\n\n`));
-	assert.match(result.editorText, /^<!--[^]*-->\n\n# Hand-off\n\nStart here\.$/);
+	assert.match(result.editorText, /^<!--[^]*-->\n\n# Hand-off\n\nStart here\.\n\n---\n\n\*\*Note on authority\.\*\*/);
+	assert.match(result.editorText, /not from a live look at the project/, "a fresh pass is marked stale");
 	assert.deepEqual(result.applied.model, current, "the destination model chosen in the dialog is applied");
 });
 

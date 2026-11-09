@@ -16,6 +16,8 @@ First release as its own package. `/hand-off` and the relay were split out of [`
 
 ### Changed
 
+- `/hand-off` writers (live and fresh) are now asked to carry over how you have been working with the agent, to separate what you required from their own inferences, to name git and test state only if they saw it, and to keep finished work brief. The fresh pass describes the conversation in the past tense, as a record rather than the project's current state.
+- Every `/hand-off` prompt ends with an editable authority note: the previous agent's plan is a starting point, your stated requirements bind, and the new agent should verify state and ask only when blocked. The provenance comment gains a "last active" time for the fresh pass and for conversations idle an hour or more.
 - Settings are read from `<agent-dir>/pi-hand-off.json`; the old `<agent-dir>/pi-clear.json` is still read when the new file does not exist.
 - The hand-off request message type is now `pi-hand-off:hand-off-request` (was `pi-clear:hand-off-request`). Session transcripts written by earlier versions are unaffected.
 - Relay session entries are `pi-hand-off:relay-hop` and `pi-hand-off:relay-stop`.

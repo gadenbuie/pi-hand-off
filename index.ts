@@ -27,10 +27,14 @@
  *      call over a *minimal reconstruction* of the conversation (no tool
  *      output, no thinking, head+tail budget), so long or stale sessions can
  *      still be handed off, and a cheap model can do the writing. It has no
- *      tool access, and its thinking level is chosen separately (provider
+ *      tool access on purpose (it describes a past conversation in the past
+ *      tense; the receiver checks current state), and its thinking level is chosen separately (provider
  *      default preselected).
  * 4. The extension prepends a provenance comment naming the source session
- *    (both writers), replaces the session, applies the chosen model and
+ *    (both writers; for the fresh pass, or a conversation idle an hour or more,
+ *    it also says when the conversation was last active) and appends an
+ *    editable authority note (the previous plan is advisory, the user's stated
+ *    requirements bind, verify state), replaces the session, applies the chosen model and
  *    thinking level, and inserts the prompt into the editor.
  * 5. The user reviews, edits, and submits the prompt themselves.
  *
@@ -477,13 +481,26 @@ function messageText(message: { role: string; content: string | Array<{ type: st
 		.join("\n");
 }
 
-function buildHandoffRequest(steering: string): string {
+/**
+ * Guidance both writers get. It is deliberately a few sentences, not a
+ * template: writers already pick a shape that fits the task, and a section list
+ * would get every section filled in.
+ */
+const WRITER_GUIDANCE = [
+	"- Tell the next agent how the user has been working with you in this conversation: standing preferences and corrections they stated, and habits such as delegation, review, commit, and communication. Use only what the user said or the conversation showed; if a later instruction contradicts an earlier one, use the latest and say so.",
+	"- Attribute constraints. Mark what the user said or the project's instructions require as binding, and present your own plans, hypotheses, and inferences as suggestions the next agent may overrule. Only decisions the user made are settled.",
+	"- Name a branch, commit, test result, or file state only if you saw it in this conversation, and say it was observed then so the next agent verifies it.",
+	"- Be as short as the task allows and follow any length guidance from the user. Finished work needs a line, not a section.",
+];
+
+export function buildHandoffRequest(steering: string): string {
 	const lines = [
 		"The user is handing this conversation off to a different model. Your next assistant message will be copied verbatim and submitted as the first user message of a brand-new session that has no memory of this conversation.",
 		"",
 		"Write that hand-off message now. It must:",
 		"- Be written as instructions to the next agent (\"you\"), not a report about this conversation.",
 		"- Assume the next agent has zero prior context: carry forward the current task and goal, what has been done so far (with concrete file paths, commands, and key decisions), and exactly what to do next.",
+		...WRITER_GUIDANCE,
 	];
 	if (steering.trim()) {
 		lines.push(
@@ -508,7 +525,9 @@ const HANDOFF_SYSTEM_PROMPT = `You are a context transfer assistant. You will re
 
 Do not continue the conversation. Do not answer questions in it.
 
-The reconstruction is lossy: tool output, thinking, and file contents are omitted, and a middle section may be elided. Do not assert file contents or the state of the working tree from memory — when something cannot be verified from the transcript, tell the next agent to verify it.`;
+The reconstruction is lossy: tool output, thinking, and file contents are omitted, and a middle section may be elided. Do not assert file contents or the state of the working tree from memory — when something cannot be verified from the transcript, tell the next agent to verify it.
+
+The conversation is a record of the past, likely from some time ago, and you cannot see the project as it is now. Describe the repository, branches, tasks, and results as they were when last seen in the conversation, in the past tense, never as the current state. Keep what the conversation established (the user's goals, decisions, and stated preferences, which may still hold) apart from what it merely observed (branch, commit, test results, file contents, which may have changed).`;
 
 const DEFAULT_COVERAGE =
 	"Cover the conversation thoroughly: the current task and goal, what has been done so far (with concrete file paths, commands, and decisions), and exactly what to do next.";
@@ -800,11 +819,12 @@ export function buildMinimalTranscript(
 }
 
 /** The single user message of the fresh pass. */
-export function buildFreshPassUserMessage(transcript: string, steering: string): string {
+export function buildFreshPassUserMessage(transcript: string, steering: string, asOf?: string): string {
 	return [
 		"## Conversation (minimal reconstruction)",
 		transcript,
 		"",
+		...(asOf ? [`The conversation was last active ${asOf}.`, ""] : []),
 		"## What the hand-off must cover",
 		steering.trim() || DEFAULT_COVERAGE,
 		"",
@@ -812,6 +832,7 @@ export function buildFreshPassUserMessage(transcript: string, steering: string):
 		'- Written as instructions to the next agent ("you"), not a report about the past.',
 		"- Assume zero prior context: current task and goal, what was done so far with concrete file paths, commands, and decisions, and exactly what to do next.",
 		"- Name the files worth opening first.",
+		...WRITER_GUIDANCE,
 		"- Reply with ONLY the hand-off message: no preamble, no postamble, no fences.",
 	].join("\n");
 }
@@ -825,15 +846,79 @@ export function buildFreshPassUserMessage(transcript: string, steering: string):
  * look it up when the prompt is not enough. It is a comment, not prose, so it
  * does not read as part of the task, and it stays visible in the editor.
  */
-export function buildProvenanceComment(sessionId: string | undefined): string {
+export function buildProvenanceComment(sessionId: string | undefined, lastActive?: string): string {
 	const id = sessionId?.trim();
-	return id ? `<!-- Handed off from pi session ${id} -->` : "";
+	if (!id) return "";
+	return lastActive
+		? `<!-- Handed off from pi session ${id}; the conversation was last active ${lastActive} -->`
+		: `<!-- Handed off from pi session ${id} -->`;
 }
 
-/** Prepends the provenance comment; called right before `writeHandoff()`. */
-function withSessionProvenance(prompt: string, ctx: ExtensionContext): string {
-	const comment = buildProvenanceComment(ctx.sessionManager.getSessionId());
-	return comment ? `${comment}\n\n${prompt}` : prompt;
+/** A hand-off from a conversation idle this long reads as stale (the prompt cache is long gone). */
+export const STALE_GAP_MS = 60 * 60 * 1000;
+
+/**
+ * "2026-11-05 21:27 UTC (3 days before this hand-off)". UTC so the text is the
+ * same wherever it is read. Returns undefined when there is no usable time.
+ */
+export function describeLastActive(lastActiveMs: number | undefined, nowMs: number): string | undefined {
+	if (lastActiveMs === undefined || !Number.isFinite(lastActiveMs) || lastActiveMs > nowMs) return undefined;
+	const minutes = Math.round((nowMs - lastActiveMs) / 60_000);
+	const plural = (n: number, unit: string) => `${n} ${unit}${n === 1 ? "" : "s"}`;
+	const gap =
+		minutes < 60
+			? plural(minutes, "minute")
+			: minutes < 48 * 60
+				? plural(Math.round(minutes / 60), "hour")
+				: plural(Math.round(minutes / (24 * 60)), "day");
+	const when = new Date(lastActiveMs).toISOString().slice(0, 16).replace("T", " ");
+	return `${when} UTC (${gap} before this hand-off)`;
+}
+
+const STANCE_NOTE =
+	"The previous agent's plan, hypotheses, and suggested next steps above are a starting point, not instructions: form your own view of the problem from the code and the task. What the user stated as requirements or preferences does bind. If what you find contradicts this hand-off, trust what you can verify and say so. Ask the user only when you are blocked or when something conflicts with what they told you.";
+
+const STALE_STANCE_NOTE =
+	"This hand-off was written from a record of an earlier conversation, not from a live look at the project. The repository and its tasks may have changed since; establish the current state yourself before acting on anything described as it was.";
+
+/** The authority note appended to a `/hand-off` prompt (never to relay hops). */
+export function buildStanceNote(stale: boolean): string {
+	return `**Note on authority.** ${STANCE_NOTE}${stale ? ` ${STALE_STANCE_NOTE}` : ""}`;
+}
+
+/** Time of the newest message in the session, or undefined when there is none. */
+function lastMessageTime(ctx: ExtensionContext): number | undefined {
+	try {
+		const entries = ctx.sessionManager.getEntries();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			if (entries[i].type !== "message") continue;
+			const ms = Date.parse(entries[i].timestamp);
+			if (Number.isFinite(ms)) return ms;
+		}
+	} catch {
+		// A replaced session's context cannot be read; there is simply no as-of line.
+	}
+	return undefined;
+}
+
+/**
+ * Adds the provenance comment and the authority note around the written
+ * prompt, right before `writeHandoff()`. The time line appears for the fresh
+ * pass (a signal the conversation is stale) and when the live conversation had
+ * been idle for `STALE_GAP_MS`.
+ */
+function withSessionProvenance(
+	prompt: string,
+	ctx: ExtensionContext,
+	frame: { fresh: boolean; lastActiveMs: number | undefined },
+): string {
+	const lastActive = describeLastActive(frame.lastActiveMs, Date.now());
+	const stale =
+		lastActive !== undefined &&
+		(frame.fresh || Date.now() - (frame.lastActiveMs as number) >= STALE_GAP_MS);
+	const comment = buildProvenanceComment(ctx.sessionManager.getSessionId(), stale ? lastActive : undefined);
+	const head = comment ? `${comment}\n\n${prompt}` : prompt;
+	return `${head}\n\n---\n\n${buildStanceNote(frame.fresh || stale)}`;
 }
 
 // ============================================================================
@@ -896,10 +981,11 @@ async function generateFreshPassPrompt(
 	transcript: string,
 	steering: string,
 	reasoning: ThinkingLevel | undefined,
+	asOf?: string,
 ): Promise<string | undefined> {
 	const userMessage = {
 		role: "user" as const,
-		content: [{ type: "text" as const, text: buildFreshPassUserMessage(transcript, steering) }],
+		content: [{ type: "text" as const, text: buildFreshPassUserMessage(transcript, steering, asOf) }],
 		timestamp: Date.now(),
 	};
 
@@ -1805,6 +1891,7 @@ export default function (pi: ExtensionAPI) {
 		writer: WriterChoice & { kind: "fresh" },
 		reasoning: ThinkingLevel | undefined,
 		steering: string,
+		lastActiveMs: number | undefined,
 	): Promise<string | undefined> {
 		const messages = ctx.sessionManager.buildSessionProjection().messages;
 		const maxSourceChars = resolveMaxSourceChars(pi.getFlag(FLAG_MAX_SOURCE_CHARS), handoffSettings);
@@ -1819,7 +1906,14 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		}
-		return generateFreshPassPrompt(ctx, writer.model, source.text, steering, reasoning);
+		return generateFreshPassPrompt(
+			ctx,
+			writer.model,
+			source.text,
+			steering,
+			reasoning,
+			describeLastActive(lastActiveMs, Date.now()),
+		);
 	}
 
 	/** Cost of the current session, 0 if it cannot be read (a replaced session's context). */
@@ -2160,6 +2254,9 @@ export default function (pi: ExtensionAPI) {
 					await ctx.waitForIdle();
 				}
 
+				// Read before the live writer's request adds a message of its own.
+				const lastActiveMs = lastMessageTime(ctx);
+
 				// Writer model: pi CLI flag > config file. There is no command-arg
 				// flag; without a configured preference the picker just opens.
 				const flagSummarizer = pi.getFlag(FLAG_SUMMARIZER);
@@ -2239,16 +2336,16 @@ export default function (pi: ExtensionAPI) {
 				const prompt =
 					writer.kind === "live"
 						? await captureFromLiveAgent(ctx, steering)
-						: await captureFromFreshPass(ctx, writer, writerReasoning, steering);
+						: await captureFromFreshPass(ctx, writer, writerReasoning, steering, lastActiveMs);
 				if (!prompt) return;
 
 				// 6. Carry everything across session replacement as plain data, with
-				// the provenance comment added here (never by the writer model).
+				// the provenance comment and authority note added here (never by the writer model).
 				writeHandoff({
 					provider: target.model.provider,
 					modelId: target.model.id,
 					thinkingLevel: level,
-					prompt: withSessionProvenance(prompt, ctx),
+					prompt: withSessionProvenance(prompt, ctx, { fresh: writer.kind === "fresh", lastActiveMs }),
 				});
 
 				const result = await ctx.newSession();

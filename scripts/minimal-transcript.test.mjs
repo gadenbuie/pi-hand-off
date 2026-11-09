@@ -8,7 +8,11 @@ import { join } from "node:path";
 import test from "node:test";
 import {
 	buildMinimalTranscript,
+	STALE_GAP_MS,
+	buildFreshPassUserMessage,
 	buildProvenanceComment,
+	buildStanceNote,
+	describeLastActive,
 	formatToolHint,
 	loadHandoffSettings,
 	parseHandoffArgs,
@@ -245,4 +249,39 @@ test("the writer thinking level accepts levels and the provider default", () => 
 	const invalid = loadHandoffSettings(path);
 	assert.deepEqual(invalid.settings, {});
 	assert.match(invalid.warning ?? "", /summarizerThinkingLevel/);
+});
+
+test("provenance can carry when the conversation was last active", () => {
+	assert.equal(
+		buildProvenanceComment("abc", "2026-11-05 21:27 UTC (3 days before this hand-off)"),
+		"<!-- Handed off from pi session abc; the conversation was last active 2026-11-05 21:27 UTC (3 days before this hand-off) -->",
+	);
+	assert.equal(buildProvenanceComment(undefined, "x"), "");
+});
+
+test("describeLastActive reports an absolute UTC time and a rounded gap", () => {
+	const now = Date.UTC(2026, 10, 8, 21, 27);
+	assert.equal(describeLastActive(Date.UTC(2026, 10, 5, 21, 27), now), "2026-11-05 21:27 UTC (3 days before this hand-off)");
+	assert.equal(describeLastActive(now - 5 * 3_600_000, now), "2026-11-08 16:27 UTC (5 hours before this hand-off)");
+	assert.equal(describeLastActive(now - 60_000, now), "2026-11-08 21:26 UTC (1 minute before this hand-off)");
+	assert.equal(describeLastActive(undefined, now), undefined);
+	assert.equal(describeLastActive(now + 1, now), undefined);
+	assert.equal(describeLastActive(Number.NaN, now), undefined);
+	assert.ok(STALE_GAP_MS >= 60_000);
+});
+
+test("the authority note says the plan is advisory and the user's rules bind", () => {
+	const fresh = buildStanceNote(false);
+	assert.match(fresh, /starting point, not instructions/);
+	assert.match(fresh, /user stated .* does bind/);
+	assert.doesNotMatch(fresh, /earlier conversation/);
+	assert.match(buildStanceNote(true), /not from a live look at the project/);
+});
+
+test("the fresh-pass message carries the as-of time and the writer guidance only when given", () => {
+	const withTime = buildFreshPassUserMessage("[User]: hi", "", "2026-11-05 21:27 UTC (3 days before this hand-off)");
+	assert.match(withTime, /last active 2026-11-05 21:27 UTC/);
+	assert.match(withTime, /how the user has been working/);
+	assert.match(withTime, /Attribute constraints/);
+	assert.doesNotMatch(buildFreshPassUserMessage("[User]: hi", ""), /last active/);
 });
