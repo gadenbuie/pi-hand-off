@@ -1,0 +1,199 @@
+# Stage @grrrck/pi-hand-off for publishing when a GitHub Release is published.
+#
+# The version does not go live here: `npm stage publish` puts it in the stage
+# queue, and a maintainer approves it with 2FA (npmjs.com → the package →
+# Staged Packages, or `npm stage approve <stage-id>`). Approval is the only
+# step that requires proof-of-presence, and an OIDC token cannot do it, so no
+# workflow ever publishes directly to the registry.
+#
+# Auth is npm trusted publishing (OIDC): no NPM_TOKEN secret is stored, and
+# staged versions get the same provenance attestation a direct publish would.
+# One-time setup on npmjs.com, under the package's Settings → Trusted
+# Publishing → GitHub Actions:
+#
+#   Organization or user: gadenbuie
+#   Repository:           pi-hand-off
+#   Workflow filename:    publish.yml      (filename only, case-sensitive)
+#   Environment name:     (leave empty)
+#
+# Leave the other permissions alone. "npm stage publish" is always allowed for
+# connections created after 2026-09-03, and "npm publish" / "npm dist-tag"
+# should stay unchecked: the point of staging is that CI cannot put a version
+# on the registry by itself.
+#
+# Because a `release` event runs the workflow from the tagged commit, this
+# file must be present on the tag it stages.
+
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  # Manual runs re-check a release without publishing, and let you retry a
+  # publish after fixing a transient failure.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to verify, e.g. v0.1.0"
+        required: true
+      dry_run:
+        description: "Run checks only, do not publish"
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm trusted publishing
+    steps:
+      - name: Resolve the release tag
+        id: release
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          tag="${EVENT_TAG:-$INPUT_TAG}"
+          if [ -z "$tag" ]; then
+            echo "::error::No release tag to publish."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          # A GitHub pre-release goes to the `next` dist-tag, never `latest`.
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            echo "dist_tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dry_run=${DRY_RUN:-false}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          # Node 24 ships npm >= 11.5.1, which trusted publishing requires.
+          # Note: no `registry-url`, which would write an .npmrc expecting a
+          # NODE_AUTH_TOKEN we deliberately do not set.
+          node-version: "24"
+
+      - name: Verify the version matches the tag and the changelog
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          node -e '
+            const { version } = require("./package.json");
+            const fs = require("node:fs");
+            const want = process.env.VERSION;
+            if (version !== want) {
+              console.error(`package.json is ${version} but the release tag ${process.env.TAG} implies ${want}`);
+              process.exit(1);
+            }
+            const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
+            const heading = new RegExp(`^## \\[${want.replace(/\./g, "\\.")}\\]`, "m");
+            if (!heading.test(changelog)) {
+              console.error(`CHANGELOG.md has no "## [${want}]" section`);
+              process.exit(1);
+            }
+            console.log(`Releasing ${version}`);
+          '
+
+      - name: Verify the tag is on main
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$(git rev-list -n1 "$TAG")" origin/main; then
+            echo "::error::Tag $TAG is not an ancestor of origin/main; refusing to publish."
+            exit 1
+          fi
+
+      # node_modules is not published (see the `files` field); these installs
+      # are only for typechecking and the offline tests.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: |
+          npx -y -p typescript tsc --noEmit --skipLibCheck \
+            --module esnext --moduleResolution bundler --target es2022 index.ts
+
+      - name: Run the offline tests
+        run: |
+          for f in scripts/*.test.mjs; do
+            echo "### $f"
+            node "$f"
+          done
+
+      - name: Check whether this version is already on npm
+        id: published
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          if npm view "@grrrck/pi-hand-off@${VERSION}" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::@grrrck/pi-hand-off@${VERSION} is already published; nothing to stage."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A version that is already published is the common re-run case. A
+      # version already sitting in the stage queue makes npm reject this step
+      # with a conflict; reject that staged version and re-run.
+      - name: Stage the release
+        if: steps.published.outputs.exists == 'false' && steps.release.outputs.dry_run != 'true'
+        id: stage
+        env:
+          DIST_TAG: ${{ steps.release.outputs.dist_tag }}
+        run: |
+          set -o pipefail
+          # `latest` is the default, so only pass a tag when we need a
+          # different one. Nothing here needs the dist-tag permission.
+          if [ "$DIST_TAG" = "latest" ]; then
+            npm stage publish --access public 2>&1 | tee stage.log
+          else
+            npm stage publish --access public --tag "$DIST_TAG" 2>&1 | tee stage.log
+          fi
+
+      - name: Summarize
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          PUBLISHED: ${{ steps.published.outputs.exists }}
+          DRY_RUN: ${{ steps.release.outputs.dry_run }}
+          DIST_TAG: ${{ steps.release.outputs.dist_tag }}
+        run: |
+          {
+            echo "### @grrrck/pi-hand-off ${VERSION}"
+            echo
+            echo "- tag: \`${TAG}\`"
+            echo "- dist-tag on approval: \`${DIST_TAG}\`"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "- **dry run**: checks only, nothing staged"
+            elif [ "$PUBLISHED" = "true" ]; then
+              echo "- already published, nothing to do"
+            else
+              echo "- **staged, awaiting approval** — 2FA required:"
+              echo "  - npmjs.com → the package → Staged Packages → Approve, or"
+              echo "  - \`npm stage approve <stage-id>\` from \`npm stage list\`"
+              echo "- staging output:"
+              echo '```'
+              tail -n 20 stage.log 2>/dev/null || echo "(no output captured)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,35 @@
+{
+	"name": "@grrrck/pi-hand-off",
+	"version": "0.1.0",
+	"description": "Pi extension that hands a conversation off to a fresh session with a new model (/hand-off), or lets agents hand off to each other autonomously with a step and cost limit (/hand-off-relay)",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"session",
+		"model",
+		"handoff",
+		"hand-off",
+		"relay"
+	],
+	"license": "MIT",
+	"author": "Garrick Aden-Buie (https://garrickadenbuie.com)",
+	"type": "module",
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gadenbuie/pi-hand-off.git"
+	},
+	"bugs": {
+		"url": "https://github.com/gadenbuie/pi-hand-off/issues"
+	},
+	"homepage": "https://github.com/gadenbuie/pi-hand-off#readme",
+	"files": ["index.ts", "README.md", "LICENSE", "CHANGELOG.md"]
+}
