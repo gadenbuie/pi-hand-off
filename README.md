@@ -90,7 +90,7 @@ For example, to work through a plan with a hand-off limit and a spending limit:
 /hand-off-relay --max-steps 8 --max-cost 5 Do the next unchecked item in PLAN.md, run the tests, tick it off, and commit.
 ```
 
-This allows up to **8 hand-offs**, or 9 agents including the current one, with a $5 cost limit. All sessions use the model and thinking level you started with. Each new agent receives the previous agent's hand-off, not the full conversation, so name the plan file or other place where progress is tracked.
+This allows up to **8 hand-offs**, or 9 agents including the current one, with a $5 cost limit. Sessions use the model and thinking level you started with; to change it for the next agent, see [Switching models between hops](#switching-models-between-hops). Each new agent receives the previous agent's hand-off, not the full conversation, so name the plan file or other place where progress is tracked.
 
 If you omit the task, the relay waits for your next message. Relays are off unless you explicitly start one.
 
@@ -102,10 +102,24 @@ Use these commands while a relay is armed:
 
 ```text
 /hand-off-relay status
+/hand-off-relay model [provider/model[:level]]
 /hand-off-relay off
 ```
 
-`status` shows the current step, spending, and sessions. `off` disarms the relay.
+`status` shows the current step, spending, sessions, and which model the next hop will use. `off` disarms the relay.
+
+### Switching models between hops
+
+`/hand-off-relay model` stages a model change for the **next** hand-off: run it in the session the relay is waiting on, with either a spec or no argument to pick from a list.
+
+```text
+/hand-off-relay model anthropic/claude-opus-4:high
+/hand-off-relay model
+```
+
+The current agent keeps its own model and prompt cache — nothing changes mid-task. When it hands off, the next session starts on the staged model instead; an omitted `:level` keeps the settling session's thinking level. `status` shows what the next hop will use, and a staged switch survives an interruption and `resume`.
+
+A staged model that has lost its auth or is no longer available is dropped with a warning at hop time, and the relay falls back to the model it was running.
 
 The relay stops when the work is complete, an agent reports it cannot continue, a limit is reached, or a run is aborted or fails to finish cleanly. If an agent needs your answer, the relay pauses in that session; reply there to let it continue. You get a notification when the relay stops, including the reason and total reported cost. You can revisit its sessions with pi's `/resume` command.
 

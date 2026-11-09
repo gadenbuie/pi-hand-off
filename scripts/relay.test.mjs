@@ -16,6 +16,7 @@ import {
 	isRelayOwnerAlive,
 	processStartTime,
 	loadPersistedRelay,
+	parseModelSpec,
 	parsePersistedRelay,
 	parseRelayArgs,
 	parseRelaySignal,
@@ -33,6 +34,10 @@ test("parseRelayArgs", () => {
 	assert.deepEqual(parseRelayArgs("off"), { kind: "off" });
 	assert.deepEqual(parseRelayArgs("status"), { kind: "status" });
 	assert.deepEqual(parseRelayArgs(""), { kind: "status" });
+	assert.deepEqual(parseRelayArgs("model"), { kind: "model", spec: "" });
+	assert.deepEqual(parseRelayArgs("model anthropic/claude-x:high"), { kind: "model", spec: "anthropic/claude-x:high" });
+	// "model" is only a subcommand as the first token; with flags first it is task text.
+	assert.deepEqual(parseRelayArgs("--max-steps 5 model the data"), { kind: "start", maxSteps: 5, maxCost: undefined, task: "model the data" });
 	assert.deepEqual(parseRelayArgs("--max-steps 5 --max-cost 2.5 go"), { kind: "start", maxSteps: 5, maxCost: 2.5, task: "go" });
 	assert.deepEqual(parseRelayArgs("--max-cost=$3 --max-steps=5"), { kind: "start", maxSteps: 5, maxCost: 3, task: "" });
 	// Flags only count before the task.
@@ -101,6 +106,44 @@ test("protocol offers done and stop, and no hand-off on the last step", () => {
 	assert.match(mid, /<hand-off stop>/);
 	assert.match(buildRelayProtocol(10, 10), /will be refused/);
 	assert.match(buildRelayNudge(2, 10, "it has no tag"), /it has no tag/);
+});
+
+test("parseModelSpec", () => {
+	assert.deepEqual(parseModelSpec("anthropic/claude-x"), { model: { provider: "anthropic", modelId: "claude-x", thinkingLevel: undefined } });
+	assert.deepEqual(parseModelSpec("  openai/gpt-5:high  "), { model: { provider: "openai", modelId: "gpt-5", thinkingLevel: "high" } });
+	// The first slash splits provider from model, as in the writer-model setting.
+	assert.deepEqual(parseModelSpec("openrouter/a/b"), { model: { provider: "openrouter", modelId: "a/b", thinkingLevel: undefined } });
+	for (const level of ["off", "max"]) {
+		assert.deepEqual(parseModelSpec(`p/m:${level}`), { model: { provider: "p", modelId: "m", thinkingLevel: level } }, level);
+	}
+	for (const bad of ["", "nomodel", "/m", "p/", "p/m:high:extra", "p/m:turbo", "p/m:"]) {
+		assert.ok(parseModelSpec(bad).error, JSON.stringify(bad));
+	}
+});
+
+test("a staged next-hop model survives persistence, and bad ones are rejected", () => {
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-hand-off-staged-"));
+	const cwd = "/tmp/staged/repo";
+	const path = relayStatePath(cwd, agentDir);
+	setRelayPersistence({ cwd, agentDir, model: { provider: "q", modelId: "m2" } });
+	writeRelay({
+		maxSteps: 3,
+		spent: 0,
+		sessionIds: ["a"],
+		nextModel: { provider: "q", modelId: "m2", thinkingLevel: "low" },
+	});
+	const saved = loadPersistedRelay(path);
+	assert.deepEqual(saved.record.relay.nextModel, { provider: "q", modelId: "m2", thinkingLevel: "low" });
+	writeRelay(undefined);
+	setRelayPersistence(undefined);
+	assert.equal(existsSync(path), false);
+
+	const base = { version: 1, pid: 123, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0, nextModel: { provider: "p", modelId: "m" } } };
+	assert.ok(parsePersistedRelay(JSON.stringify(base)).record.relay.nextModel);
+	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, relay: { ...base.relay, nextModel: { provider: 1 } } })).error);
+	// An unknown thinking level is tolerated (kept undefined), as for `model`.
+	const lenient = parsePersistedRelay(JSON.stringify({ ...base, relay: { ...base.relay, nextModel: { provider: "p", modelId: "m", thinkingLevel: "turbo" } } }));
+	assert.equal(lenient.record.relay.nextModel.thinkingLevel, undefined);
 });
 
 const relay = (over = {}) => ({ maxSteps: 5, sessionIds: ["a", "b"], spent: 0, ...over });
@@ -238,6 +281,7 @@ test("relay state persists to disk and clears on stop", () => {
 		spent: 0.5,
 		paused: undefined,
 		pending: { prompt: "next" },
+		nextModel: undefined,
 	});
 	assert.deepEqual(saved.record.model, model);
 

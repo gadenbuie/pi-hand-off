@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-09
+
+### Added
+
+- `/hand-off-relay model [provider/model[:level]]` stages the model of the relay's next hand-off; with no argument it opens the model picker. The current agent keeps its model (and its prompt cache); the staged model replaces the carried-over one when the agent hands off, and an omitted `:level` keeps the settling session's thinking level. A staged model that loses availability or auth before the hop is dropped with a warning and the relay keeps its current model. The staged model survives an interruption and `resume`.
+- `/hand-off-relay status` now shows which model the next hop will use.
+
 ## [0.1.1] - 2026-11-09
 
 ### Changed

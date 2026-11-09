@@ -59,7 +59,13 @@
  * Tags in code fences never count. Each hop appends a
  * `pi-hand-off:relay-hop` session entry (step, model, tokens, cost), and every
  * stop appends a `pi-hand-off:relay-stop` entry (step, reason, spent).
- * `/hand-off-relay off` disarms; bare or `status` reports. Every `writeRelay`
+ * `/hand-off-relay off` disarms; bare or `status` reports.
+ * `/hand-off-relay model [provider/model[:level]]` stages the model of the
+ * *next* hop (with no argument it opens the destination picker): the current
+ * session keeps its own model, so its prompt cache survives, and the settle
+ * handler swaps the staged model into the hop and the handoff. A staged model
+ * that has become unavailable or lost its auth is dropped with a warning at
+ * hop time. Every `writeRelay`
  * also mirrors the state to `<agent-dir>/pi-hand-off/relays/<cwd-hash>.json`
  * (best effort; deleted when the relay stops), so a relay interrupted by a
  * crash or quit can be continued with `/hand-off-relay resume`: a pending
@@ -1303,6 +1309,13 @@ interface RelayState {
 	/** The current session was already asked once to fix a missing/malformed final message. */
 	nudged?: boolean;
 	/**
+	 * Model staged with `/hand-off-relay model` for the next hop. Consumed by
+	 * the next settle (which writes it into the hop and the handoff); the
+	 * current session keeps running on its own model, so its prompt cache
+	 * survives.
+	 */
+	nextModel?: PersistedRelayModel;
+	/**
 	 * A hand-off extracted from the settled agent, waiting for the step command.
 	 * `started` flips once that command runs, so a watchdog can tell "never ran".
 	 */
@@ -1359,6 +1372,24 @@ export function relayStatePath(cwd: string, agentDir: string = getAgentDir()): s
 	return join(agentDir, "pi-hand-off", "relays", `${hash}.json`);
 }
 
+/** Validate one persisted `{provider, modelId, thinkingLevel?}` object. */
+function parsePersistedModel(value: unknown, label: string): { model?: PersistedRelayModel; error?: string } {
+	if (value === undefined) return {};
+	const m = value as { provider?: unknown; modelId?: unknown; thinkingLevel?: unknown };
+	if (!isRecord(m) || typeof m.provider !== "string" || typeof m.modelId !== "string") {
+		return { error: `invalid ${label}` };
+	}
+	return {
+		model: {
+			provider: m.provider,
+			modelId: m.modelId,
+			thinkingLevel: THINKING_LEVELS.includes(m.thinkingLevel as ThinkingLevel)
+				? (m.thinkingLevel as ThinkingLevel)
+				: undefined,
+		},
+	};
+}
+
 /** Validate untrusted JSON from disk; returns an error string instead of throwing. */
 export function parsePersistedRelay(raw: string): { record: PersistedRelay } | { error: string } {
 	let data: unknown;
@@ -1386,18 +1417,14 @@ export function parsePersistedRelay(raw: string): { record: PersistedRelay } | {
 		return { error: "invalid pending hand-off" };
 	}
 	let model: PersistedRelayModel | undefined;
-	if (data.model !== undefined) {
-		const m = data.model;
-		if (!isRecord(m) || typeof m.provider !== "string" || typeof m.modelId !== "string") {
-			return { error: "invalid model" };
-		}
-		model = {
-			provider: m.provider,
-			modelId: m.modelId,
-			thinkingLevel: THINKING_LEVELS.includes(m.thinkingLevel as ThinkingLevel)
-				? (m.thinkingLevel as ThinkingLevel)
-				: undefined,
-		};
+	const parsedModel = parsePersistedModel(data.model, "model");
+	if (parsedModel.error) return { error: parsedModel.error };
+	model = parsedModel.model;
+	let nextModel: PersistedRelayModel | undefined;
+	if (relay.nextModel !== undefined) {
+		const parsedNext = parsePersistedModel(relay.nextModel, "nextModel");
+		if (parsedNext.error) return { error: parsedNext.error };
+		nextModel = parsedNext.model;
 	}
 	if (!Number.isInteger(data.pid) || (data.pid as number) < 1) return { error: "invalid pid" };
 	return {
@@ -1415,6 +1442,7 @@ export function parsePersistedRelay(raw: string): { record: PersistedRelay } | {
 				spent: relay.spent,
 				paused: relay.paused === true ? true : undefined,
 				pending: pending ? { prompt: (pending as { prompt: string }).prompt } : undefined,
+				nextModel,
 			},
 		},
 	};
@@ -1527,6 +1555,7 @@ function persistRelay(relay: RelayState | undefined): void {
 				spent: relay.spent,
 				paused: relay.paused,
 				pending: relay.pending ? { prompt: relay.pending.prompt } : undefined,
+				nextModel: relay.nextModel,
 			},
 		};
 		mkdirSync(dirname(path), { recursive: true });
@@ -1549,11 +1578,12 @@ export type RelayArgs =
 	| { kind: "start"; maxSteps: number; maxCost?: number; task: string }
 	| { kind: "off" }
 	| { kind: "status" }
+	| { kind: "model"; spec: string }
 	| { kind: "resume" }
 	| { kind: "error"; error: string };
 
 const RELAY_USAGE =
-	"/hand-off-relay needs `--max-steps N` (the number of hand-offs; the agent you start in is step 0 and not counted), or `off` / `status` / `resume`";
+	"/hand-off-relay needs `--max-steps N` (the number of hand-offs; the agent you start in is step 0 and not counted), or `off` / `status` / `model` / `resume`";
 
 /** Value of `--name V` or `--name=V` at `tokens[i]`, and how many tokens it used. */
 function flagValue(tokens: string[], i: number, name: string): { raw: string | undefined; used: number } | undefined {
@@ -1565,14 +1595,15 @@ function flagValue(tokens: string[], i: number, name: string): { raw: string | u
 
 /**
  * Parse `--max-steps N [--max-cost USD] [task text]`, or `off` / `status` /
- * `resume`; no arguments means `status`. Like `/hand-off`, flags are only
- * recognized before the task, in any order.
+ * `resume` / `model [spec]`; no arguments means `status`. Like `/hand-off`, flags
+ * are only recognized before the task, in any order.
  */
 export function parseRelayArgs(args: string): RelayArgs {
 	const tokens = args.split(/\s+/).filter(Boolean);
 	const first = tokens[0];
 	if (first === undefined || first === "status") return { kind: "status" };
 	if (first === "off") return { kind: "off" };
+	if (first === "model") return { kind: "model", spec: tokens.slice(1).join(" ") };
 	if (first === "resume") return { kind: "resume" };
 
 	let maxSteps: number | undefined;
@@ -1600,6 +1631,31 @@ export function parseRelayArgs(args: string): RelayArgs {
 	}
 	if (maxSteps === undefined) return { kind: "error", error: RELAY_USAGE };
 	return { kind: "start", maxSteps, maxCost, task: tokens.slice(i).join(" ") };
+}
+
+/**
+ * Parse `provider/model` or `provider/model:level` for `/hand-off-relay model`.
+ * The provider is everything before the first `/` (as in the writer-model
+ * setting); an omitted level means "keep the settling session's level".
+ */
+export function parseModelSpec(spec: string): { model: PersistedRelayModel } | { error: string } {
+	const text = spec.trim();
+	const slash = text.indexOf("/");
+	if (slash <= 0) return { error: `expected "provider/model" or "provider/model:level", got "${text}"` };
+	const provider = text.slice(0, slash).trim();
+	let modelId = text.slice(slash + 1).trim();
+	let thinkingLevel: ThinkingLevel | undefined;
+	const colon = modelId.lastIndexOf(":");
+	if (colon !== -1) {
+		const suffix = modelId.slice(colon + 1).trim();
+		if (!THINKING_LEVELS.includes(suffix as ThinkingLevel)) {
+			return { error: `":${suffix || modelId.slice(colon + 1)}" is not a thinking level (one of ${THINKING_LEVELS.join(", ")})` };
+		}
+		thinkingLevel = suffix as ThinkingLevel;
+		modelId = modelId.slice(0, colon).trim();
+	}
+	if (!provider || !modelId) return { error: `expected "provider/model" or "provider/model:level", got "${text}"` };
+	return { model: { provider, modelId, thinkingLevel } };
 }
 
 export type RelaySignal =
@@ -2001,14 +2057,35 @@ export default function (pi: ExtensionAPI) {
 		const model = ctx.model;
 		if (!model) return stopRelay(ctx, "no model to carry over", "error");
 
+		// A model staged with `/hand-off-relay model` replaces the carried-over
+		// model for this hop only. A staged model that has become unavailable or
+		// lost its auth is dropped with a warning rather than poisoning the hop.
+		let carried: PersistedRelayModel = {
+			provider: model.provider,
+			modelId: model.id,
+			thinkingLevel: ctx.thinkingLevel,
+		};
+		const staged = relay.nextModel;
+		if (staged) {
+			const found = ctx.modelRegistry.find(staged.provider, staged.modelId);
+			if (found && ctx.modelRegistry.hasConfiguredAuth(found)) {
+				carried = { provider: found.provider, modelId: found.id, thinkingLevel: staged.thinkingLevel ?? ctx.thinkingLevel };
+			} else {
+				ctx.ui.notify(
+					`pi-hand-off relay: staged model ${staged.provider}/${staged.modelId} is ${found ? "missing auth" : "no longer available"}; keeping ${model.provider}/${model.id}`,
+					"warning",
+				);
+			}
+		}
+
 		const { step, spent } = decision;
 		const fromSessionId = ctx.sessionManager.getSessionId();
 		pi.appendEntry(RELAY_HOP_ENTRY_TYPE, {
 			step,
 			maxSteps: relay.maxSteps,
-			provider: model.provider,
-			modelId: model.id,
-			thinkingLevel: ctx.thinkingLevel,
+			provider: carried.provider,
+			modelId: carried.modelId,
+			thinkingLevel: carried.thinkingLevel,
 			tokens: { input: totals.input, output: totals.output, total: totals.total },
 			cost: totals.cost,
 			at: new Date().toISOString(),
@@ -2017,12 +2094,9 @@ export default function (pi: ExtensionAPI) {
 		const pending = {
 			prompt: buildRelayPrompt(decision.body, { step: step + 1, maxSteps: relay.maxSteps, fromSessionId }),
 		};
-		setRelayPersistence({
-			cwd: ctx.cwd,
-			model: { provider: model.provider, modelId: model.id, thinkingLevel: ctx.thinkingLevel },
-		});
-		writeRelay({ ...relay, spent, nudged: false, pending });
-		writeHandoff({ provider: model.provider, modelId: model.id, thinkingLevel: ctx.thinkingLevel });
+		setRelayPersistence({ cwd: ctx.cwd, model: carried });
+		writeRelay({ ...relay, spent, nudged: false, nextModel: undefined, pending });
+		writeHandoff({ provider: carried.provider, modelId: carried.modelId, thinkingLevel: carried.thinkingLevel });
 		// Event contexts cannot replace the session; a command context can, so
 		// hand the work to the internal command (processed after settled handlers).
 		pi.sendUserMessage(`/${RELAY_COMMAND}`, { expandPromptTemplates: true });
@@ -2115,7 +2189,9 @@ export default function (pi: ExtensionAPI) {
 				return ctx.ui.notify("The saved relay has no model to carry over. `/hand-off-relay off` discards it.", "error");
 			}
 			const pending = { prompt: relay.pending.prompt };
-			writeRelay({ ...relay, pending });
+			// The handoff already carries the saved model; a staged switch must not
+			// fire a second time on the hop after next.
+			writeRelay({ ...relay, pending, nextModel: undefined });
 			writeHandoff({ provider: model.provider, modelId: model.modelId, thinkingLevel: model.thinkingLevel });
 			ctx.ui.notify(`Resuming hand-off relay: starting step ${relayStep(relay) + 1} of ${relay.maxSteps}`, "info");
 			pi.sendUserMessage(`/${RELAY_COMMAND}`, { expandPromptTemplates: true });
@@ -2140,6 +2216,58 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	/** Handles `/hand-off-relay model [provider/model[:level]]`: stage the next hop's model. */
+	async function handleRelayModel(ctx: ExtensionCommandContext, relay: RelayState | undefined, spec: string): Promise<void> {
+		if (!relay) {
+			const other = relayOwnedByOtherProcess(ctx.cwd);
+			if (other) {
+				return ctx.ui.notify(`${ownedElsewhereMessage(other.record)} Its model can only be changed in that process.`, "warning");
+			}
+			return ctx.ui.notify("No hand-off relay is active. Start one with /hand-off-relay --max-steps N.", "info");
+		}
+		if (relay.pending) {
+			return ctx.ui.notify("The next hand-off is already starting; too late to switch its model.", "warning");
+		}
+		if (relay.sessionIds.at(-1) !== ctx.sessionManager.getSessionId()) {
+			return ctx.ui.notify(
+				`The relay is waiting on session ${relay.sessionIds.at(-1)}, not this one. Run /hand-off-relay model there, or /hand-off-relay off to clear the relay.`,
+				"warning",
+			);
+		}
+
+		const stage = (staged: PersistedRelayModel): void => {
+			setRelayPersistence({ cwd: ctx.cwd, model: staged });
+			writeRelay({ ...relay, nextModel: staged });
+			ctx.ui.notify(
+				`Next hand-off hop will use ${staged.provider}/${staged.modelId}${staged.thinkingLevel ? `:${staged.thinkingLevel}` : ""}. This session keeps its model; the switch takes effect when the agent hands off.`,
+				"info",
+			);
+		};
+
+		if (!spec.trim()) {
+			const picked = await pickTargetModel(ctx, {
+				title: "Model for the next hand-off hop",
+				providerTitle: "Provider for the next hand-off hop",
+			});
+			if (!picked) return;
+			if (!ctx.modelRegistry.hasConfiguredAuth(picked.model)) {
+				return ctx.ui.notify(`No auth configured for ${picked.model.provider}/${picked.model.id}; the relay keeps its current model`, "error");
+			}
+			return stage({ provider: picked.model.provider, modelId: picked.model.id, thinkingLevel: picked.thinkingLevel });
+		}
+
+		const parsedSpec = parseModelSpec(spec);
+		if ("error" in parsedSpec) return ctx.ui.notify(parsedSpec.error, "error");
+		const model = ctx.modelRegistry.find(parsedSpec.model.provider, parsedSpec.model.modelId);
+		if (!model) {
+			return ctx.ui.notify(`Model ${parsedSpec.model.provider}/${parsedSpec.model.modelId} is not available; the relay keeps its current model`, "error");
+		}
+		if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+			return ctx.ui.notify(`No auth configured for ${model.provider}/${model.id}; the relay keeps its current model`, "error");
+		}
+		stage({ provider: model.provider, modelId: model.id, thinkingLevel: parsedSpec.model.thinkingLevel });
+	}
+
 	/** Handles `/hand-off-relay \u2026`. */
 	async function handleRelayCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
 		const parsed = parseRelayArgs(args);
@@ -2162,6 +2290,13 @@ export default function (pi: ExtensionAPI) {
 			const lines = [
 				`Hand-off relay ${relay.paused ? "paused" : "active"}: step ${relayStep(relay)} of ${relay.maxSteps}, $${relay.spent.toFixed(2)} spent before this session${relay.maxCost !== undefined ? ` (limit $${relay.maxCost.toFixed(2)})` : ""}`,
 			];
+			const staged = relay.nextModel;
+			const next = staged
+				? `${staged.provider}/${staged.modelId}${staged.thinkingLevel ? ` · ${staged.thinkingLevel}` : ""} (staged with /hand-off-relay model)`
+				: ctx.model
+					? `${ctx.model.provider}/${ctx.model.id}${ctx.thinkingLevel ? ` · ${ctx.thinkingLevel}` : ""} (carries over; /hand-off-relay model switches it)`
+					: undefined;
+			if (next) lines.push(`Next hop: ${next}`);
 			if (relay.sessionIds.length > 1) lines.push(`Sessions: ${relay.sessionIds.join(" \u2192 ")}`);
 			if (relay.sessionIds.at(-1) !== sessionId) {
 				lines.push(`Waiting on session ${relay.sessionIds.at(-1)}, not this one. \`/hand-off-relay off\` clears it.`);
@@ -2176,6 +2311,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Hand-off relay disarmed", "info");
 			return;
 		}
+		if (parsed.kind === "model") return handleRelayModel(ctx, relay, parsed.spec);
 		if (flowInProgress) return ctx.ui.notify("A hand-off is already in progress", "warning");
 		if (parsed.kind === "resume") return resumeRelay(ctx, relay);
 		if (!ctx.model) return ctx.ui.notify("/hand-off-relay: the current session has no model to carry over", "error");
@@ -2202,7 +2338,7 @@ export default function (pi: ExtensionAPI) {
 		writeRelay({ maxSteps: parsed.maxSteps, maxCost: parsed.maxCost, spent: 0, sessionIds: [sessionId] });
 		const stale = relay ? " Replaced a stale relay." : interrupted ? " Replaced an interrupted relay." : "";
 		ctx.ui.notify(
-			`Hand-off relay armed: up to ${parsed.maxSteps} hand-offs${parsed.maxCost !== undefined ? `, $${parsed.maxCost.toFixed(2)} limit` : ", no cost limit"}, same model each hop.${stale} Agents run unattended with your full tool access. \`/hand-off-relay off\` stops it.`,
+			`Hand-off relay armed: up to ${parsed.maxSteps} hand-offs${parsed.maxCost !== undefined ? `, $${parsed.maxCost.toFixed(2)} limit` : ", no cost limit"}, same model each hop unless you stage a switch with \`/hand-off-relay model\`.${stale} Agents run unattended with your full tool access. \`/hand-off-relay off\` stops it.`,
 			"info",
 		);
 		const protocol = buildRelayProtocol(0, parsed.maxSteps);
@@ -2228,7 +2364,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("hand-off-relay", {
 		description:
-			"Autonomous hand-off relay: /hand-off-relay --max-steps <N> [--max-cost USD] [task] lets agents hand off to each other for up to N hand-offs (the first agent is step 0); `off` disarms, `status` reports, `resume` continues an interrupted relay",
+			"Autonomous hand-off relay: /hand-off-relay --max-steps <N> [--max-cost USD] [task] lets agents hand off to each other for up to N hand-offs (the first agent is step 0); `model [provider/model[:level]]` stages the next hop's model; `off` disarms, `status` reports, `resume` continues an interrupted relay",
 		handler: async (args, ctx) => handleRelayCommand(args, ctx),
 	});
 

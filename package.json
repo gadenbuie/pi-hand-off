@@ -1,6 +1,6 @@
 {
 	"name": "@grrrck/pi-hand-off",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "Pi extension that hands a conversation off to a fresh session with a new model (/hand-off), or lets agents hand off to each other autonomously with a step and cost limit (/hand-off-relay)",
 	"keywords": [
 		"pi-package",
@@ -31,5 +31,10 @@
 		"url": "https://github.com/gadenbuie/pi-hand-off/issues"
 	},
 	"homepage": "https://github.com/gadenbuie/pi-hand-off#readme",
-	"files": ["index.ts", "README.md", "LICENSE", "CHANGELOG.md"]
+	"files": [
+		"index.ts",
+		"README.md",
+		"LICENSE",
+		"CHANGELOG.md"
+	]
 }
