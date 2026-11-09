@@ -1,7 +1,8 @@
 // Offline tests for the autonomous hand-off relay helpers.
 // Run with Node 24+: node --test scripts/relay.test.mjs
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,11 +12,13 @@ import {
 	buildRelayProtocol,
 	decideBudgetAction,
 	decideRelayAction,
+	isProcessAlive,
 	loadPersistedRelay,
 	parsePersistedRelay,
 	parseRelayArgs,
 	parseRelaySignal,
 	readRelay,
+	relayOwnedByOtherProcess,
 	relayStatePath,
 	setRelayPersistence,
 	writeRelay,
@@ -246,7 +249,7 @@ test("relay state persists to disk and clears on stop", () => {
 test("parsePersistedRelay rejects bad data", () => {
 	assert.match(parsePersistedRelay("{").error, /malformed/);
 	assert.ok(parsePersistedRelay(JSON.stringify({ version: 2 })).error);
-	const base = { version: 1, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } };
+	const base = { version: 1, pid: 123, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } };
 	assert.ok(parsePersistedRelay(JSON.stringify(base)).record);
 	for (const bad of [
 		{ ...base.relay, maxSteps: 0 },
@@ -258,6 +261,8 @@ test("parsePersistedRelay rejects bad data", () => {
 		assert.ok(parsePersistedRelay(JSON.stringify({ ...base, relay: bad })).error, JSON.stringify(bad));
 	}
 	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, model: { provider: 1 } })).error);
+	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, pid: 0 })).error);
+	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, pid: undefined })).error);
 });
 
 test("loadPersistedRelay reports unreadable files", () => {
@@ -265,4 +270,28 @@ test("loadPersistedRelay reports unreadable files", () => {
 	const path = join(dir, "x.json");
 	writeFileSync(path, "not json");
 	assert.ok(loadPersistedRelay(path).error);
+});
+
+test("a relay owned by another live process is left alone; a dead owner's is interrupted", () => {
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-hand-off-owner-"));
+	const cwd = "/tmp/owner/repo";
+	const path = relayStatePath(cwd, agentDir);
+	mkdirSync(join(agentDir, "pi-hand-off", "relays"), { recursive: true });
+	const save = (pid) =>
+		writeFileSync(path, JSON.stringify({ version: 1, pid, cwd, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } }));
+
+	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined); // no file
+
+	save(process.ppid); // our parent: alive, and not us
+	assert.equal(isProcessAlive(process.ppid), true);
+	assert.equal(relayOwnedByOtherProcess(cwd, agentDir).record.pid, process.ppid);
+
+	save(process.pid); // our own file is never "another process"
+	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined);
+
+	const child = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
+	const deadPid = Number(child.stdout.toString());
+	assert.equal(isProcessAlive(deadPid), false);
+	save(deadPid);
+	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined);
 });

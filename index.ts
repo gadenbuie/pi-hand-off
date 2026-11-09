@@ -61,7 +61,10 @@
  * crash or quit can be continued with `/hand-off-relay resume`: a pending
  * hand-off is replayed into a new session, otherwise the relay re-arms on the
  * session it was interrupted in (which must be the open one). `session_start`
- * reports a saved relay when none is running in this process.
+ * reports a saved relay when none is running in this process. The file
+ * records the writing pid: a live other pid means the relay is running in
+ * another pi process (no warning; `resume`, `off`, and arming are refused), a
+ * dead one means it was interrupted. One relay per directory.
  *
  * Settings live in `<agent-dir>/pi-hand-off.json` (falling back to the legacy
  * `pi-clear.json`; read once per
@@ -1252,6 +1255,8 @@ export interface PersistedRelayModel {
 
 export interface PersistedRelay {
 	version: 1;
+	/** The pi process that wrote this; a live pid means the relay is running, a dead one means it was interrupted. */
+	pid: number;
 	cwd: string;
 	savedAt: string;
 	model?: PersistedRelayModel;
@@ -1304,9 +1309,11 @@ export function parsePersistedRelay(raw: string): { record: PersistedRelay } | {
 				: undefined,
 		};
 	}
+	if (!Number.isInteger(data.pid) || (data.pid as number) < 1) return { error: "invalid pid" };
 	return {
 		record: {
 			version: 1,
+			pid: data.pid as number,
 			cwd: typeof data.cwd === "string" ? data.cwd : "",
 			savedAt: typeof data.savedAt === "string" ? data.savedAt : "",
 			model,
@@ -1334,6 +1341,35 @@ export function loadPersistedRelay(path: string): { record: PersistedRelay } | {
 	return parsePersistedRelay(raw);
 }
 
+/** Whether a process with this pid exists. A reused pid can look alive; that errs on the safe side. */
+export function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as { code?: string }).code === "EPERM";
+	}
+}
+
+/**
+ * The saved relay for `cwd` when another live pi process owns it (so this
+ * process must leave it alone), or undefined when there is none or its owner
+ * is gone.
+ */
+export function relayOwnedByOtherProcess(
+	cwd: string,
+	agentDir?: string,
+): { record: PersistedRelay } | undefined {
+	const saved = loadPersistedRelay(relayStatePath(cwd, agentDir));
+	if (!saved || "error" in saved) return undefined;
+	const { pid } = saved.record;
+	return pid !== process.pid && isProcessAlive(pid) ? saved : undefined;
+}
+
+function ownedElsewhereMessage(record: PersistedRelay): string {
+	return `A hand-off relay is running in another pi process (pid ${record.pid}) in this directory, at step ${relayStep(record.relay)} of ${record.relay.maxSteps}.`;
+}
+
 /** Where, and with which model, the running relay is persisted; set when a relay arms or a session starts. */
 let persistence: { cwd: string; agentDir?: string; model?: PersistedRelayModel } | undefined;
 
@@ -1351,6 +1387,7 @@ function persistRelay(relay: RelayState | undefined): void {
 		}
 		const record: PersistedRelay = {
 			version: 1,
+			pid: process.pid,
 			cwd: persistence.cwd,
 			savedAt: new Date().toISOString(),
 			model: persistence.model,
@@ -1924,6 +1961,8 @@ export default function (pi: ExtensionAPI) {
 		if (active) {
 			return ctx.ui.notify("A hand-off relay is already armed in this process. `/hand-off-relay off` clears it first.", "warning");
 		}
+		const other = relayOwnedByOtherProcess(ctx.cwd);
+		if (other) return ctx.ui.notify(`${ownedElsewhereMessage(other.record)} Nothing to resume.`, "warning");
 		const saved = loadPersistedRelay(relayStatePath(ctx.cwd));
 		if (!saved) return ctx.ui.notify("No interrupted hand-off relay to resume in this directory", "info");
 		if ("error" in saved) {
@@ -1972,6 +2011,8 @@ export default function (pi: ExtensionAPI) {
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (parsed.kind === "status") {
 			if (!relay) {
+				const other = relayOwnedByOtherProcess(ctx.cwd);
+				if (other) return ctx.ui.notify(ownedElsewhereMessage(other.record), "info");
 				const saved = loadPersistedRelay(relayStatePath(ctx.cwd));
 				if (saved && "record" in saved) {
 					return ctx.ui.notify(
@@ -1991,6 +2032,8 @@ export default function (pi: ExtensionAPI) {
 			return ctx.ui.notify(lines.join("\n"), "info");
 		}
 		if (parsed.kind === "off") {
+			const other = relay ? undefined : relayOwnedByOtherProcess(ctx.cwd);
+			if (other) return ctx.ui.notify(`${ownedElsewhereMessage(other.record)} It can only be stopped from that process.`, "warning");
 			setRelayPersistence({ cwd: ctx.cwd, model: persistence?.model });
 			writeRelay(undefined);
 			ctx.ui.notify("Hand-off relay disarmed", "info");
@@ -2003,6 +2046,14 @@ export default function (pi: ExtensionAPI) {
 			const how = relay.paused ? "paused, waiting for your reply" : "already running";
 			return ctx.ui.notify(`A relay is ${how} in this session. \`/hand-off-relay off\` stops it first.`, "warning");
 		}
+		const other = relay ? undefined : relayOwnedByOtherProcess(ctx.cwd);
+		if (other) {
+			return ctx.ui.notify(
+				`${ownedElsewhereMessage(other.record)} Only one relay can run per directory; start this one elsewhere, or after that one stops.`,
+				"warning",
+			);
+		}
+		const interrupted = !relay && loadPersistedRelay(relayStatePath(ctx.cwd)) !== undefined;
 		if (!ctx.isIdle()) await ctx.waitForIdle();
 
 		// A relay waiting on some other session is stale (its session was left
@@ -2012,7 +2063,7 @@ export default function (pi: ExtensionAPI) {
 			model: { provider: ctx.model.provider, modelId: ctx.model.id, thinkingLevel: ctx.thinkingLevel },
 		});
 		writeRelay({ maxSteps: parsed.maxSteps, maxCost: parsed.maxCost, spent: 0, sessionIds: [sessionId] });
-		const stale = relay ? " Replaced a stale relay." : "";
+		const stale = relay ? " Replaced a stale relay." : interrupted ? " Replaced an interrupted relay." : "";
 		ctx.ui.notify(
 			`Hand-off relay armed: up to ${parsed.maxSteps} hand-offs${parsed.maxCost !== undefined ? `, $${parsed.maxCost.toFixed(2)} limit` : ", no cost limit"}, same model each hop.${stale} Agents run unattended with your full tool access. \`/hand-off-relay off\` stops it.`,
 			"info",
@@ -2200,7 +2251,8 @@ export default function (pi: ExtensionAPI) {
 		setRelayPersistence({ cwd: ctx.cwd, model: persistence?.cwd === ctx.cwd ? persistence?.model : undefined });
 		if (!readRelay() && event.reason !== "new") {
 			const saved = loadPersistedRelay(relayStatePath(ctx.cwd));
-			if (saved && "record" in saved) {
+			// A relay that another live pi process is running is not interrupted.
+			if (saved && "record" in saved && !relayOwnedByOtherProcess(ctx.cwd)) {
 				const r = saved.record.relay;
 				ctx.ui.notify(
 					`A hand-off relay was interrupted at step ${relayStep(r)} of ${r.maxSteps} ($${r.spent.toFixed(2)} spent before that session). \`/hand-off-relay resume\` continues it; \`/hand-off-relay off\` discards it.`,

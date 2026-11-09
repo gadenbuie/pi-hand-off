@@ -151,6 +151,8 @@ The relay's progress is saved to `<agent-dir>/pi-hand-off/relays/`, one file per
 - `/hand-off-relay resume` continues it. If the interruption came between two agents, the next session starts from the saved hand-off; if it came mid-step, open that session with `/resume` first and run `resume` there, and the agent is asked to pick up where it left off.
 - `/hand-off-relay off` discards it.
 
+Only one relay can run per working directory. The saved file records the pi process that owns it, so a second pi in the same directory is not confused by it: it shows no "interrupted" warning, `/hand-off-relay status` says the relay is running in another process (with its pid), and `resume`, `off` and arming a second relay are refused until that process stops. You can still use other pi sessions in that directory for anything else, including a different task that happens not to be a relay. A file whose process has exited is treated as interrupted. A pid that the OS has reused can make a dead relay look alive; if that happens, delete the file under `<agent-dir>/pi-hand-off/relays/`.
+
 The saved file holds the step count, spend, session IDs, and the pending hand-off text, so it can contain whatever the agent wrote there.
 
 ## Configuration
