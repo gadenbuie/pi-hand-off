@@ -13,6 +13,8 @@ import {
 	decideBudgetAction,
 	decideRelayAction,
 	isProcessAlive,
+	isRelayOwnerAlive,
+	processStartTime,
 	loadPersistedRelay,
 	parsePersistedRelay,
 	parseRelayArgs,
@@ -277,8 +279,8 @@ test("a relay owned by another live process is left alone; a dead owner's is int
 	const cwd = "/tmp/owner/repo";
 	const path = relayStatePath(cwd, agentDir);
 	mkdirSync(join(agentDir, "pi-hand-off", "relays"), { recursive: true });
-	const save = (pid) =>
-		writeFileSync(path, JSON.stringify({ version: 1, pid, cwd, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } }));
+	const save = (pid, startedAt) =>
+		writeFileSync(path, JSON.stringify({ version: 1, pid, startedAt, cwd, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } }));
 
 	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined); // no file
 
@@ -294,4 +296,33 @@ test("a relay owned by another live process is left alone; a dead owner's is int
 	assert.equal(isProcessAlive(deadPid), false);
 	save(deadPid);
 	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined);
+});
+
+test("a reused pid is told apart by its start time", (t) => {
+	const started = processStartTime(process.ppid);
+	if (!started) return t.skip("ps cannot report a start time here");
+	assert.equal(isRelayOwnerAlive(process.ppid, started), true);
+	assert.equal(isRelayOwnerAlive(process.ppid, "Mon Jan  1 00:00:00 2001"), false);
+	assert.equal(isRelayOwnerAlive(process.ppid, undefined), true); // no saved start time: pid decides
+
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-hand-off-reuse-"));
+	const cwd = "/tmp/reuse/repo";
+	mkdirSync(join(agentDir, "pi-hand-off", "relays"), { recursive: true });
+	const path = relayStatePath(cwd, agentDir);
+	const relay = { maxSteps: 3, sessionIds: ["a"], spent: 0 };
+	writeFileSync(path, JSON.stringify({ version: 1, pid: process.ppid, startedAt: started, cwd, relay }));
+	assert.ok(relayOwnedByOtherProcess(cwd, agentDir));
+	writeFileSync(path, JSON.stringify({ version: 1, pid: process.ppid, startedAt: "Mon Jan  1 00:00:00 2001", cwd, relay }));
+	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined);
+});
+
+test("a written relay records the owner's pid and start time", () => {
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-hand-off-owner2-"));
+	setRelayPersistence({ cwd: "/tmp/own/repo", agentDir });
+	writeRelay({ maxSteps: 2, spent: 0, sessionIds: ["a"] });
+	const saved = loadPersistedRelay(relayStatePath("/tmp/own/repo", agentDir));
+	assert.equal(saved.record.pid, process.pid);
+	assert.equal(saved.record.startedAt, processStartTime(process.pid));
+	writeRelay(undefined);
+	setRelayPersistence(undefined);
 });

@@ -62,7 +62,8 @@
  * hand-off is replayed into a new session, otherwise the relay re-arms on the
  * session it was interrupted in (which must be the open one). `session_start`
  * reports a saved relay when none is running in this process. The file
- * records the writing pid: a live other pid means the relay is running in
+ * records the writing pid and its `ps` start time (a reused pid has a different
+ * one; with no start time the pid alone decides): a live other pid means the relay is running in
  * another pi process (no warning; `resume`, `off`, and arming are refused), a
  * dead one means it was interrupted. One relay per directory.
  *
@@ -86,6 +87,7 @@
  *   into the editor with `ctx.ui.setEditorText()`.
  */
 
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -1257,6 +1259,8 @@ export interface PersistedRelay {
 	version: 1;
 	/** The pi process that wrote this; a live pid means the relay is running, a dead one means it was interrupted. */
 	pid: number;
+	/** When that process started (`ps` text); tells it apart from an unrelated process that reused the pid. */
+	startedAt?: string;
 	cwd: string;
 	savedAt: string;
 	model?: PersistedRelayModel;
@@ -1314,6 +1318,7 @@ export function parsePersistedRelay(raw: string): { record: PersistedRelay } | {
 		record: {
 			version: 1,
 			pid: data.pid as number,
+			startedAt: typeof data.startedAt === "string" && data.startedAt ? data.startedAt : undefined,
 			cwd: typeof data.cwd === "string" ? data.cwd : "",
 			savedAt: typeof data.savedAt === "string" ? data.savedAt : "",
 			model,
@@ -1341,6 +1346,43 @@ export function loadPersistedRelay(path: string): { record: PersistedRelay } | {
 	return parsePersistedRelay(raw);
 }
 
+/**
+ * Start time of a process as `ps` prints it, or undefined when it cannot be
+ * read (no `ps`, no such process, Windows). `LC_ALL=C` keeps the format
+ * identical between the process that writes it and the one that compares it.
+ */
+export function processStartTime(pid: number): string | undefined {
+	try {
+		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+			encoding: "utf8",
+			timeout: 2000,
+			env: { ...process.env, LC_ALL: "C" },
+		});
+		const text = result.status === 0 ? result.stdout.trim() : "";
+		return text || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+let cachedOwnStartTime: string | undefined | null = null;
+function ownStartTime(): string | undefined {
+	if (cachedOwnStartTime === null) cachedOwnStartTime = processStartTime(process.pid);
+	return cachedOwnStartTime;
+}
+
+/**
+ * Whether the process that wrote a saved relay is still running. A pid alone
+ * can be reused by an unrelated process, so when both sides have a start time
+ * they must match; if either could not be read, the pid check decides.
+ */
+export function isRelayOwnerAlive(pid: number, startedAt: string | undefined): boolean {
+	if (!isProcessAlive(pid)) return false;
+	if (!startedAt) return true;
+	const current = processStartTime(pid);
+	return current === undefined || current === startedAt;
+}
+
 /** Whether a process with this pid exists. A reused pid can look alive; that errs on the safe side. */
 export function isProcessAlive(pid: number): boolean {
 	try {
@@ -1362,8 +1404,8 @@ export function relayOwnedByOtherProcess(
 ): { record: PersistedRelay } | undefined {
 	const saved = loadPersistedRelay(relayStatePath(cwd, agentDir));
 	if (!saved || "error" in saved) return undefined;
-	const { pid } = saved.record;
-	return pid !== process.pid && isProcessAlive(pid) ? saved : undefined;
+	const { pid, startedAt } = saved.record;
+	return pid !== process.pid && isRelayOwnerAlive(pid, startedAt) ? saved : undefined;
 }
 
 function ownedElsewhereMessage(record: PersistedRelay): string {
@@ -1388,6 +1430,7 @@ function persistRelay(relay: RelayState | undefined): void {
 		const record: PersistedRelay = {
 			version: 1,
 			pid: process.pid,
+			startedAt: ownStartTime(),
 			cwd: persistence.cwd,
 			savedAt: new Date().toISOString(),
 			model: persistence.model,
