@@ -10,6 +10,9 @@ import {
 	buildRelayNudge,
 	buildRelayPrompt,
 	buildRelayProtocol,
+	completeRelayBackgroundTask,
+	continueRelayForTurn,
+	continueRelayForUser,
 	decideBudgetAction,
 	decideRelayAction,
 	isProcessAlive,
@@ -22,10 +25,12 @@ import {
 	parseRelaySignal,
 	readRelay,
 	relayOwnedByOtherProcess,
+	relayPhase,
 	relayStatePath,
 	setRelayPersistence,
 	writeRelay,
 	sumUsage,
+	trackRelayBackgroundTask,
 } from "../index.ts";
 
 test("parseRelayArgs", () => {
@@ -49,13 +54,15 @@ test("parseRelayArgs", () => {
 	}
 });
 
-test("parseRelaySignal accepts only a tag wrapping the whole message", () => {
+test("parseRelaySignal accepts one unfenced signal with prose around it", () => {
 	assert.deepEqual(parseRelaySignal("\n<hand-off>\nDid step 1.\n</hand-off>\n"), { kind: "hand-off", body: "Did step 1." });
 	assert.deepEqual(parseRelaySignal("<hand-off done/>"), { kind: "done" });
 	assert.deepEqual(parseRelaySignal("<hand-off done />"), { kind: "done" });
 	assert.deepEqual(parseRelaySignal("All finished, nothing more."), { kind: "none" });
 	assert.equal(parseRelaySignal("<hand-off>  </hand-off>").kind, "invalid");
-	assert.equal(parseRelaySignal("Done!\n<hand-off>x</hand-off>").kind, "invalid");
+	assert.deepEqual(parseRelaySignal("Done!\n<hand-off>x</hand-off>"), { kind: "hand-off", body: "x" });
+	assert.equal(parseRelaySignal("<hand-off>unfinished").kind, "invalid");
+	assert.equal(parseRelaySignal("<hand-off done/>\n<hand-off>x</hand-off>").kind, "invalid");
 	// A literal tag inside the body is text, not a nested hand-off.
 	assert.deepEqual(parseRelaySignal("<hand-off>a <hand-off>b</hand-off></hand-off>"), {
 		kind: "hand-off",
@@ -96,7 +103,7 @@ test("relay prompt carries provenance and the protocol", () => {
 test("parseRelaySignal handles stop with a reason", () => {
 	assert.deepEqual(parseRelaySignal("<hand-off stop>tests fail: X</hand-off>"), { kind: "stop", reason: "tests fail: X" });
 	assert.equal(parseRelaySignal("<hand-off stop> </hand-off>").kind, "invalid");
-	assert.equal(parseRelaySignal("Blocked.\n<hand-off stop>x</hand-off>").kind, "invalid");
+	assert.deepEqual(parseRelaySignal("Blocked.\n<hand-off stop>x</hand-off>"), { kind: "stop", reason: "x" });
 });
 
 test("protocol offers done and stop, and no hand-off on the last step", () => {
@@ -104,6 +111,7 @@ test("protocol offers done and stop, and no hand-off on the last step", () => {
 	assert.match(mid, /<hand-off>/);
 	assert.match(mid, /<hand-off done\/>/);
 	assert.match(mid, /<hand-off stop>/);
+	assert.match(mid, /Do not emit `hand-off`, `done`, `pause`, or `stop`/);
 	assert.match(buildRelayProtocol(10, 10), /will be refused/);
 	assert.match(buildRelayNudge(2, 10, "it has no tag"), /it has no tag/);
 });
@@ -183,12 +191,14 @@ test("decideRelayAction stops on done and on an agent stop reason", () => {
 	assert.match(stop.reason, /need a key/);
 });
 
-test("decideRelayAction nudges once on a missing or bad tag, then stops", () => {
-	for (const text of ["All finished.", "<hand-off></hand-off>"]) {
-		const last = { stopReason: "stop", text };
-		assert.equal(decide({ last }).kind, "nudge", text);
-		assert.equal(decide({ last }, { nudged: true }).kind, "stop", text);
-	}
+test("decideRelayAction waits on a missing tag and recovers from a bad tag", () => {
+	const missing = { stopReason: "stop", text: "All finished." };
+	assert.equal(decide({ last: missing }).kind, "idle");
+	assert.equal(decide({ last: missing }, { nudged: true }).kind, "idle");
+
+	const malformed = { stopReason: "stop", text: "<hand-off></hand-off>" };
+	assert.equal(decide({ last: malformed }).kind, "nudge");
+	assert.equal(decide({ last: malformed }, { nudged: true }).kind, "attention");
 });
 
 test("decideRelayAction counts hand-offs, not the first agent, against the limit", () => {
@@ -203,6 +213,7 @@ test("decideRelayAction enforces the hand-off limit but still allows done/stop a
 	const refused = decide({ sessionId: "f" }, atLimit);
 	assert.equal(refused.kind, "stop");
 	assert.match(refused.reason, /limit of 5 hand-offs/);
+	assert.equal(refused.limit, "steps");
 	assert.equal(decide({ sessionId: "f", last: { stopReason: "stop", text: "<hand-off done/>" } }, atLimit).level, "info");
 });
 
@@ -212,6 +223,7 @@ test("decideRelayAction enforces --max-cost across sessions, before hop and nudg
 	const over = decide({}, { maxCost: 2, spent: 1.4 });
 	assert.equal(over.kind, "stop");
 	assert.match(over.reason, /\$2\.00 limit/);
+	assert.equal(over.limit, "cost");
 	assert.equal(decide({ last: { stopReason: "stop", text: "no tag" } }, { maxCost: 1, spent: 1 }).kind, "stop");
 	assert.equal(decide({}, {}).kind, "hop");
 });
@@ -245,23 +257,64 @@ test("decideBudgetAction sends one message, the highest level, when a step jumps
 test("pause is its own signal, distinct from stop and done", () => {
 	assert.deepEqual(parseRelaySignal("<hand-off pause>Which database?</hand-off>"), { kind: "pause", reason: "Which database?" });
 	assert.equal(parseRelaySignal("<hand-off pause> </hand-off>").kind, "invalid");
-	assert.equal(parseRelaySignal("Question below.\n<hand-off pause>x</hand-off>").kind, "invalid");
+	assert.deepEqual(parseRelaySignal("Question below.\n<hand-off pause>x</hand-off>"), { kind: "pause", reason: "x" });
 	assert.match(buildRelayProtocol(1, 3), /<hand-off pause>/);
 });
 
-test("decideRelayAction pauses without ending the relay, then resumes on the next settle", () => {
+test("a user pause survives notifications and clears only for human input or resume", () => {
 	const last = { stopReason: "stop", text: "<hand-off pause>Which database?</hand-off>" };
 	assert.deepEqual(decide({ last }, { nudged: true }), { kind: "pause", reason: "Which database?" });
-	// After the user replies the agent settles again; the relay evaluates it as usual.
-	assert.equal(decide({}, { paused: true }).kind, "hop");
-	assert.equal(decide({ last: { stopReason: "stop", text: "<hand-off done/>" } }, { paused: true }).kind, "stop");
+	const paused = relay({ waiting: { kind: "user", reason: "Which database?" } });
+	assert.equal(decide({}, paused).kind, "ignore");
+	assert.equal(decide({ last: { stopReason: "stop", text: "<hand-off done/>" } }, paused).kind, "ignore");
+	assert.equal(decide({}, continueRelayForTurn(paused)).kind, "ignore");
+	assert.equal(decide({}, continueRelayForUser(paused)).kind, "hop");
 	// A pause is allowed even on the last hand-off.
 	const atLimit = { sessionIds: ["a", "b", "c", "d", "e", "f"] };
 	assert.equal(decide({ sessionId: "f", last }, atLimit).kind, "pause");
 });
 
-test("parseRelayArgs resume", () => {
+test("known background work defers every signal until its notification turn", () => {
+	const task = { id: "agent-1", type: "explore", description: "inspect lifecycle", source: "pi-subagents", background: true };
+	let state = trackRelayBackgroundTask(relay(), task);
+	assert.equal(decide({ last: { stopReason: "error", text: "partial" } }, state).kind, "stop");
+	for (const text of ["waiting", "<hand-off>next</hand-off>", "<hand-off done/>", "<hand-off stop>waiting</hand-off>", "<hand-off pause>wait?</hand-off>"]) {
+		assert.equal(decide({ last: { stopReason: "stop", text } }, state).kind, "wait", text);
+	}
+	state = { ...state, waiting: { kind: "background" } };
+	state = completeRelayBackgroundTask(state, "pi-subagents", "agent-1");
+	assert.deepEqual(state.backgroundNotifications, ["agent-1"]);
+	assert.equal(decide({}, state).kind, "wait");
+	assert.equal(decide({}, continueRelayForTurn(state)).kind, "wait", "an unrelated turn cannot consume the result");
+	const delivered = { ...state, backgroundNotifications: undefined };
+	assert.equal(decide({}, continueRelayForTurn(delivered)).kind, "hop");
+});
+
+test("unsignalled and attention waits are retried by any later turn", () => {
+	const unsignalled = relay({ waiting: { kind: "unsignalled", reason: "no tag" } });
+	assert.equal(relayPhase(unsignalled), "unsignalled");
+	assert.equal(decide({}, unsignalled).kind, "wait");
+	assert.equal(decide({}, continueRelayForTurn(unsignalled)).kind, "hop");
+
+	const attention = relay({ waiting: { kind: "attention", reason: "bad tag" }, nudged: true });
+	assert.equal(decide({}, attention).kind, "ignore");
+	assert.equal(decide({}, continueRelayForTurn(attention)).kind, "hop");
+});
+
+test("a failed advance is attention, not a terminal or merely advancing state", () => {
+	const state = relay({ pending: { prompt: "next" }, waiting: { kind: "attention", reason: "replacement failed" } });
+	assert.equal(relayPhase(state), "attention");
+	assert.equal(decide({}, state).kind, "ignore");
+	assert.deepEqual(continueRelayForTurn(state).waiting, state.waiting);
+	assert.deepEqual(continueRelayForUser(state).waiting, state.waiting);
+});
+
+test("parseRelayArgs resume and recovery limit overrides", () => {
 	assert.deepEqual(parseRelayArgs("resume"), { kind: "resume" });
+	assert.deepEqual(parseRelayArgs("resume --max-steps 8 --max-cost $6"), { kind: "resume", maxSteps: 8, maxCost: 6 });
+	assert.deepEqual(parseRelayArgs("resume --max-cost=2.5"), { kind: "resume", maxCost: 2.5 });
+	assert.equal(parseRelayArgs("resume --max-steps 0").kind, "error");
+	assert.equal(parseRelayArgs("resume unexpectedly").kind, "error");
 });
 
 test("relay state persists to disk and clears on stop", () => {
@@ -279,11 +332,33 @@ test("relay state persists to disk and clears on stop", () => {
 		sessionIds: ["a", "b"],
 		maxCost: 2,
 		spent: 0.5,
-		paused: undefined,
+		waiting: undefined,
+		backgroundTasks: undefined,
+		backgroundNotifications: undefined,
 		pending: { prompt: "next" },
 		nextModel: undefined,
 	});
 	assert.deepEqual(saved.record.model, model);
+
+	writeRelay({
+		maxSteps: 4,
+		spent: 0.5,
+		sessionIds: ["a", "b"],
+		waiting: { kind: "background" },
+		backgroundTasks: [{ id: "x", type: "explore", description: "inspect", source: "pi-subagents", background: true }],
+		backgroundNotifications: ["x"],
+	});
+	assert.deepEqual(loadPersistedRelay(path).record.relay, {
+		maxSteps: 4,
+		sessionIds: ["a", "b"],
+		maxCost: undefined,
+		spent: 0.5,
+		waiting: { kind: "background" },
+		backgroundTasks: [{ id: "x", type: "explore", description: "inspect", source: "pi-subagents", background: true }],
+		backgroundNotifications: ["x"],
+		pending: undefined,
+		nextModel: undefined,
+	});
 
 	writeRelay(undefined);
 	assert.equal(existsSync(path), false);
@@ -297,18 +372,37 @@ test("parsePersistedRelay rejects bad data", () => {
 	assert.ok(parsePersistedRelay(JSON.stringify({ version: 2 })).error);
 	const base = { version: 1, pid: 123, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } };
 	assert.ok(parsePersistedRelay(JSON.stringify(base)).record);
+	const stopped = parsePersistedRelay(JSON.stringify({
+		...base,
+		stopped: { reason: "done", level: "info", at: "2026-01-01T00:00:00Z" },
+	}));
+	assert.equal(stopped.record.stopped.reason, "done");
+	assert.deepEqual(
+		parsePersistedRelay(JSON.stringify({ ...base, relay: { ...base.relay, paused: true } })).record.relay.waiting,
+		{ kind: "user", reason: "the agent asked for your answer" },
+	);
 	for (const bad of [
 		{ ...base.relay, maxSteps: 0 },
 		{ ...base.relay, sessionIds: [] },
 		{ ...base.relay, spent: -1 },
 		{ ...base.relay, maxCost: 0 },
 		{ ...base.relay, pending: { prompt: 5 } },
+		{ ...base.relay, pending: { prompt: "next", deliverHere: "yes" } },
+		{ ...base.relay, pending: { prompt: "next", deliverHere: true, targetSessionId: 5 } },
+		{ ...base.relay, waiting: { kind: "user" } },
+		{ ...base.relay, backgroundTasks: [{ id: "x" }] },
+		{ ...base.relay, backgroundNotifications: ["x", 5] },
 	]) {
 		assert.ok(parsePersistedRelay(JSON.stringify({ ...base, relay: bad })).error, JSON.stringify(bad));
 	}
 	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, model: { provider: 1 } })).error);
 	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, pid: 0 })).error);
 	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, pid: undefined })).error);
+	assert.ok(parsePersistedRelay(JSON.stringify({ ...base, stopped: { reason: "done" } })).error);
+	assert.ok(parsePersistedRelay(JSON.stringify({
+		...base,
+		stopped: { reason: "limit", level: "warning", at: "now", limit: "unknown" },
+	})).error);
 });
 
 test("loadPersistedRelay reports unreadable files", () => {
@@ -323,14 +417,17 @@ test("a relay owned by another live process is left alone; a dead owner's is int
 	const cwd = "/tmp/owner/repo";
 	const path = relayStatePath(cwd, agentDir);
 	mkdirSync(join(agentDir, "pi-hand-off", "relays"), { recursive: true });
-	const save = (pid, startedAt) =>
-		writeFileSync(path, JSON.stringify({ version: 1, pid, startedAt, cwd, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } }));
+	const save = (pid, startedAt, stopped) =>
+		writeFileSync(path, JSON.stringify({ version: 1, pid, startedAt, cwd, stopped, relay: { maxSteps: 3, sessionIds: ["a"], spent: 0 } }));
 
 	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined); // no file
 
 	save(process.ppid); // our parent: alive, and not us
 	assert.equal(isProcessAlive(process.ppid), true);
 	assert.equal(relayOwnedByOtherProcess(cwd, agentDir).record.pid, process.ppid);
+
+	save(process.ppid, undefined, { reason: "done", level: "info", at: "now" });
+	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined, "stopped snapshots have no live owner");
 
 	save(process.pid); // our own file is never "another process"
 	assert.equal(relayOwnedByOtherProcess(cwd, agentDir), undefined);

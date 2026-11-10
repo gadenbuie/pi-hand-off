@@ -16,6 +16,7 @@ async function openPicker({ scopedModels = [], model = other } = {}) {
 		registerFlag: () => {},
 		getFlag: () => undefined,
 		on: () => {},
+		events: { on: () => () => {} },
 	});
 	let component;
 	let selected;

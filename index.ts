@@ -39,27 +39,43 @@
  * 5. The user reviews, edits, and submits the prompt themselves.
  *
  * `/hand-off-relay --max-steps N [--max-cost USD] [task]`: opt-in autonomous relay. Arms a run of up to
- * N hand-offs: the current agent is step 0 and not counted, so up to N+1 sessions. Each agent ends its work with a final
- * message that is exactly one `<hand-off>…</hand-off>` block; on
+ * N hand-offs: the current agent is step 0 and not counted, so up to N+1 sessions. Each agent ends its work with one
+ * `<hand-off>…</hand-off>` block (a user-facing summary may surround it); on
  * `agent_settled` the extension extracts it and replaces the session through
  * an internal command (event contexts cannot), keeping the same model and
  * thinking level, and submits the block plus a provenance header and the
  * relay protocol as the next agent's first message. The relay state lives on
  * `globalThis` for the whole run. An agent may instead end with
  * `<hand-off done/>`, `<hand-off stop>reason</hand-off>`, or
- * `<hand-off pause>question</hand-off>` (the relay stays armed on that session and
- * resumes at its next settle, once the user has replied). A missing or
- * malformed tag gets one reminder message, then the relay stops. It also stops,
- * with a notification (including total spent), on: abort, a non-clean stop,
- * the step limit, `--max-cost` (escalating steering warnings at 80/95/98% of
- * the limit after tool turns, a hard abort at 100%, and no new session at
- * 95%+), or a watchdog if the internal advance command never starts.
- * The decision logic is the pure `decideRelayAction`. Arming refuses while a
- * relay runs in this session and replaces one waiting on another session.
- * Tags in code fences never count. Each hop appends a
+ * `<hand-off pause>question</hand-off>`. Explicit user pauses clear only for
+ * human input or `resume`, not for unrelated notification-driven turns.
+ *
+ * A clean settle without a signal becomes an armed `unsignalled` wait: any
+ * later turn retries it, which supports arbitrary background-notification
+ * systems. An optional pi-subagents adapter adds exact outstanding-task
+ * tracking and defers every clean signal until results are delivered or read.
+ * A malformed tag gets one correction, then a recoverable `attention` wait.
+ * Replacement failure preserves the pending hand-off for `resume`. Delivery is
+ * acknowledged by the exact user message starting, not by `input`; until then
+ * the replacement is not a committed step and a watchdog keeps failure
+ * recoverable. `resume` also re-prompts any idle unfinished relay.
+ *
+ * Terminal stops (done, explicit stop, abort, non-clean finish, step/cost
+ * limits) deactivate the relay but retain a stopped snapshot for `resume`.
+ * Limit stops require a higher `--max-steps` or `--max-cost` on resume. Cost
+ * handling uses escalating steering warnings
+ * at 80/95/98%, a hard abort at 100%, and no new session at 95%+. Stop and
+ * `off` append a model-visible deactivation message so stale protocol
+ * instructions do not provoke more tags. The decision logic is the pure
+ * `decideRelayAction`; docs/relay-lifecycle.md has the complete state diagram.
+ * Arming refuses while a relay runs in this session and replaces one waiting
+ * on another session. Tags in code fences never count. Each hop appends a
  * `pi-hand-off:relay-hop` session entry (step, model, tokens, cost), and every
  * stop appends a `pi-hand-off:relay-stop` entry (step, reason, spent).
- * `/hand-off-relay off` disarms; bare or `status` reports.
+ * `/hand-off-relay off` disarms an active relay recoverably and discards an
+ * already stopped/interrupted snapshot. Bare or `status` reports the state and
+ * its next action; `resume` handles idle, paused, failed-advance, stopped, and
+ * interrupted states.
  * `/hand-off-relay model [provider/model[:level]]` stages the model of the
  * *next* hop (with no argument it opens the destination picker): the current
  * session keeps its own model, so its prompt cache survives, and the settle
@@ -67,10 +83,13 @@
  * that has become unavailable or lost its auth is dropped with a warning at
  * hop time. Every `writeRelay`
  * also mirrors the state to `<agent-dir>/pi-hand-off/relays/<cwd-hash>.json`
- * (best effort; deleted when the relay stops), so a relay interrupted by a
+ * (best effort; marked stopped or deleted when discarded), so a relay stopped
+ * unexpectedly or interrupted by a
  * crash or quit can be continued with `/hand-off-relay resume`: a pending
  * hand-off is replayed into a new session, otherwise the relay re-arms on the
- * session it was interrupted in (which must be the open one). `session_start`
+ * session it was interrupted in (which must be the open one). An undelivered
+ * replacement can replay from the previous session if its blank session is
+ * unavailable. `session_start`
  * reports a saved relay when none is running in this process. The file
  * records the writing pid and its `ps` start time (a reused pid has a different
  * one; with no start time the pid alone decides): a live other pid means the relay is running in
@@ -1289,6 +1308,22 @@ async function chooseWriter(ctx: ExtensionContext, options: WriterOptions): Prom
  * Relay state, kept on `globalThis` for the whole run (unlike `SessionHandoff`
  * it is not consumed) so the depth counter survives session replacement.
  */
+export interface RelayBackgroundTask {
+	id: string;
+	type: string;
+	description: string;
+	/** Adapter that reported this task, e.g. `pi-subagents`. */
+	source: string;
+	/** Whether completion is expected to arrive in a later notification. */
+	background?: boolean;
+}
+
+export type RelayWaiting =
+	| { kind: "user"; reason: string }
+	| { kind: "attention"; reason: string }
+	| { kind: "background" }
+	| { kind: "unsignalled"; reason: string };
+
 interface RelayState {
 	/** Maximum number of hand-offs; the agent that armed the relay is step 0 and not counted. */
 	maxSteps: number;
@@ -1302,8 +1337,17 @@ interface RelayState {
 	maxCost?: number;
 	/** Cost of the sessions already left; the current session's cost is added on top. */
 	spent: number;
-	/** The agent asked the user a question and the relay is waiting for them (cleared on the next settle). */
-	paused?: boolean;
+	/**
+	 * Why an idle relay must not evaluate the latest assistant message as a
+	 * final relay signal. User waits clear only for interactive human input or
+	 * `resume`. Unsignalled and attention waits also clear when another turn
+	 * starts. Background waits additionally require result delivery/consumption.
+	 */
+	waiting?: RelayWaiting;
+	/** Background work reported by an optional integration such as pi-subagents. */
+	backgroundTasks?: RelayBackgroundTask[];
+	/** Completed background result IDs not yet delivered to or read by the main agent. */
+	backgroundNotifications?: string[];
 	/** Highest budget warning level already sent in the current session (0 = none). */
 	warned?: number;
 	/** The current session was already asked once to fix a missing/malformed final message. */
@@ -1319,19 +1363,123 @@ interface RelayState {
 	 * A hand-off extracted from the settled agent, waiting for the step command.
 	 * `started` flips once that command runs, so a watchdog can tell "never ran".
 	 */
-	pending?: { prompt: string; started?: boolean };
+	pending?: { prompt: string; started?: boolean; deliverHere?: boolean; targetSessionId?: string };
 }
 
 const RELAY_KEY = "__pi_hand_off_relay__";
+const RELAY_STOPPED_KEY = "__pi_hand_off_relay_stopped__";
+const RELAY_DELIVERY_KEY = "__pi_hand_off_relay_delivery__";
+
+interface RelayDeliveryAttempt {
+	cwd: string;
+	targetSessionId: string;
+	prompt: string;
+	state: "preflight" | "failed";
+}
+
+function readDeliveryAttempt(): RelayDeliveryAttempt | undefined {
+	return (globalThis as Record<string, unknown>)[RELAY_DELIVERY_KEY] as RelayDeliveryAttempt | undefined;
+}
+
+/** Prevent two resumes from entering pi's non-cancellable input/model/auth preflight. */
+function claimDelivery(cwd: string, targetSessionId: string, prompt: string): { attempt?: RelayDeliveryAttempt; error?: string } {
+	const existing = readDeliveryAttempt();
+	if (existing?.state === "preflight" && existing.cwd === cwd && existing.prompt === prompt) {
+		return {
+			error: "An earlier hand-off send may still be in pi's input/model/auth preflight. Wait for it to finish; if it is stuck, restart pi and resume the saved relay. No duplicate prompt was sent.",
+		};
+	}
+	const attempt: RelayDeliveryAttempt = { cwd, targetSessionId, prompt, state: "preflight" };
+	(globalThis as Record<string, unknown>)[RELAY_DELIVERY_KEY] = attempt;
+	return { attempt };
+}
+
+function finishDelivery(attempt: RelayDeliveryAttempt, failed: boolean): void {
+	if (readDeliveryAttempt() !== attempt) return;
+	if (failed) attempt.state = "failed";
+	else delete (globalThis as Record<string, unknown>)[RELAY_DELIVERY_KEY];
+}
 const RELAY_COMMAND = "pi-hand-off-relay-advance";
 /** How long the internal advance command has to start before the relay gives up. */
 const ADVANCE_WATCHDOG_MS = 10_000;
 const RELAY_PROTOCOL_TYPE = "pi-hand-off:relay-protocol";
+const RELAY_STATE_TYPE = "pi-hand-off:relay-state";
 const RELAY_HOP_ENTRY_TYPE = "pi-hand-off:relay-hop";
 const RELAY_STOP_ENTRY_TYPE = "pi-hand-off:relay-stop";
 
 export function readRelay(): RelayState | undefined {
 	return (globalThis as Record<string, unknown>)[RELAY_KEY] as RelayState | undefined;
+}
+
+export function relayPhase(relay: RelayState): "advancing" | RelayWaiting["kind"] | "running" {
+	if (relay.waiting?.kind === "attention") return "attention";
+	if (relay.pending) return "advancing";
+	return relay.waiting?.kind ?? "running";
+}
+
+function relayPhaseLabel(relay: RelayState): string {
+	const labels = {
+		running: "running",
+		background: "waiting for background work",
+		unsignalled: "idle without a relay signal",
+		user: "waiting for your reply",
+		attention: "needs attention",
+		advancing: "advancing",
+	} as const;
+	return labels[relayPhase(relay)];
+}
+
+function awaitingBackgroundNotification(relay: RelayState | undefined): boolean {
+	return (relay?.backgroundNotifications?.length ?? 0) > 0;
+}
+
+function clearBackgroundNotifications(relay: RelayState, ids?: readonly string[]): void {
+	const pending = ids
+		? (relay.backgroundNotifications ?? []).filter((id) => !ids.includes(id))
+		: [];
+	relay.backgroundNotifications = pending.length > 0 ? pending : undefined;
+	if (pending.length === 0 && (relay.backgroundTasks?.length ?? 0) === 0 && relay.waiting?.kind === "background") {
+		relay.waiting = undefined;
+	}
+}
+
+/** Add or refresh a background task reported by an integration adapter. */
+export function trackRelayBackgroundTask(relay: RelayState, task: RelayBackgroundTask): RelayState {
+	const existing = relay.backgroundTasks?.find((candidate) => candidate.id === task.id && candidate.source === task.source);
+	const merged = { ...task, background: existing?.background || task.background || undefined };
+	const others = relay.backgroundTasks?.filter((candidate) => candidate !== existing) ?? [];
+	return { ...relay, backgroundTasks: [...others, merged] };
+}
+
+/** Mark a task complete and guard its result until delivery or consumption. */
+export function completeRelayBackgroundTask(relay: RelayState, source: string, id: string): RelayState {
+	const task = relay.backgroundTasks?.find((candidate) => candidate.id === id && candidate.source === source);
+	if (!task) return relay;
+	const remaining = relay.backgroundTasks?.filter((candidate) => candidate !== task) ?? [];
+	const backgroundNotifications = relay.backgroundNotifications ?? [];
+	const pending = task.background && !backgroundNotifications.includes(id)
+		? [...backgroundNotifications, id]
+		: backgroundNotifications;
+	return {
+		...relay,
+		backgroundTasks: remaining.length > 0 ? remaining : undefined,
+		backgroundNotifications: pending.length > 0 ? pending : undefined,
+	};
+}
+
+/** A later turn retries generic waits, but never discards an unread background result. */
+export function continueRelayForTurn(relay: RelayState): RelayState {
+	if (relay.pending) return relay;
+	return {
+		...relay,
+		waiting: relay.waiting?.kind === "user" ? relay.waiting : undefined,
+	};
+}
+
+/** Actual human input clears explicit waits, but still cannot discard unread results. */
+export function continueRelayForUser(relay: RelayState): RelayState {
+	if (relay.pending) return relay;
+	return { ...relay, waiting: undefined, nudged: false };
 }
 
 /** 0-based position of the current agent: the one that armed the relay is step 0. */
@@ -1343,9 +1491,10 @@ function relayStep(relay: RelayState): number {
 //
 // The in-process `globalThis` state stays the source of truth; every
 // `writeRelay` mirrors it to `<agent-dir>/pi-hand-off/relays/<cwd-hash>.json`
-// (best effort) so a relay interrupted by a crash or a quit can be resumed
-// with `/hand-off-relay resume`. One file per working directory, so relays in
-// different repos never collide. A normal stop, `off`, or `done` deletes it.
+// (best effort) so a stopped relay or one interrupted by a crash or quit can
+// be resumed with `/hand-off-relay resume`. One file per working directory, so
+// relays in different repos never collide. `off` on a stopped/interrupted
+// snapshot discards it; starting or resuming a relay replaces it with active state.
 
 /** Model and thinking level to restore when a persisted relay is resumed. */
 export interface PersistedRelayModel {
@@ -1354,9 +1503,17 @@ export interface PersistedRelayModel {
 	thinkingLevel?: ThinkingLevel;
 }
 
+export interface RelayStopped {
+	reason: string;
+	level: "info" | "warning" | "error";
+	at: string;
+	/** A limit stop requires a correspondingly higher override on resume. */
+	limit?: "steps" | "cost";
+}
+
 export interface PersistedRelay {
 	version: 1;
-	/** The pi process that wrote this; a live pid means the relay is running, a dead one means it was interrupted. */
+	/** Writer identity for active records; stopped snapshots have no active owner. */
 	pid: number;
 	/** When that process started (`ps` text); tells it apart from an unrelated process that reused the pid. */
 	startedAt?: string;
@@ -1364,6 +1521,8 @@ export interface PersistedRelay {
 	savedAt: string;
 	model?: PersistedRelayModel;
 	relay: RelayState;
+	/** Terminal autonomy is off, but the user can still resume this snapshot. */
+	stopped?: RelayStopped;
 }
 
 /** Where the relay for `cwd` is persisted. */
@@ -1413,9 +1572,53 @@ export function parsePersistedRelay(raw: string): { record: PersistedRelay } | {
 		return { error: "invalid maxCost" };
 	}
 	const pending = relay.pending;
-	if (pending !== undefined && !(isRecord(pending) && typeof pending.prompt === "string")) {
+	if (
+		pending !== undefined &&
+		!(isRecord(pending) && typeof pending.prompt === "string" &&
+			(pending.deliverHere === undefined || typeof pending.deliverHere === "boolean") &&
+			(pending.targetSessionId === undefined || (typeof pending.targetSessionId === "string" && pending.targetSessionId)))
+	) {
 		return { error: "invalid pending hand-off" };
 	}
+	let waiting: RelayWaiting | undefined;
+	if (relay.waiting !== undefined) {
+		const candidate = relay.waiting;
+		if (!isRecord(candidate) || !["user", "attention", "background", "unsignalled"].includes(candidate.kind as string)) {
+			return { error: "invalid waiting state" };
+		}
+		if (candidate.kind === "background") waiting = { kind: "background" };
+		else if (typeof candidate.reason === "string" && candidate.reason.trim()) {
+			waiting = { kind: candidate.kind as "user" | "attention" | "unsignalled", reason: candidate.reason };
+		} else return { error: "invalid waiting reason" };
+	} else if (relay.paused === true) {
+		// Version-1 files before the explicit waiting state only stored `paused`.
+		waiting = { kind: "user", reason: "the agent asked for your answer" };
+	}
+	const backgroundTasks: RelayBackgroundTask[] = [];
+	if (relay.backgroundTasks !== undefined) {
+		if (!Array.isArray(relay.backgroundTasks)) return { error: "invalid background tasks" };
+		for (const value of relay.backgroundTasks) {
+			if (
+				!isRecord(value) ||
+				typeof value.id !== "string" || !value.id ||
+				typeof value.type !== "string" ||
+				typeof value.description !== "string" ||
+				typeof value.source !== "string" || !value.source
+			) return { error: "invalid background task" };
+			backgroundTasks.push({
+				id: value.id,
+				type: value.type,
+				description: value.description,
+				source: value.source,
+				background: value.background === true ? true : undefined,
+			});
+		}
+	}
+	if (
+		relay.backgroundNotifications !== undefined &&
+		(!Array.isArray(relay.backgroundNotifications) ||
+			!relay.backgroundNotifications.every((id) => typeof id === "string" && id))
+	) return { error: "invalid background notifications" };
 	let model: PersistedRelayModel | undefined;
 	const parsedModel = parsePersistedModel(data.model, "model");
 	if (parsedModel.error) return { error: parsedModel.error };
@@ -1426,6 +1629,22 @@ export function parsePersistedRelay(raw: string): { record: PersistedRelay } | {
 		if (parsedNext.error) return { error: parsedNext.error };
 		nextModel = parsedNext.model;
 	}
+	let stopped: RelayStopped | undefined;
+	if (data.stopped !== undefined) {
+		if (
+			!isRecord(data.stopped) ||
+			typeof data.stopped.reason !== "string" || !data.stopped.reason ||
+			!["info", "warning", "error"].includes(data.stopped.level as string) ||
+			typeof data.stopped.at !== "string" || !data.stopped.at ||
+			(data.stopped.limit !== undefined && !["steps", "cost"].includes(data.stopped.limit as string))
+		) return { error: "invalid stopped state" };
+		stopped = {
+			reason: data.stopped.reason,
+			level: data.stopped.level as RelayStopped["level"],
+			at: data.stopped.at,
+			limit: data.stopped.limit as RelayStopped["limit"],
+		};
+	}
 	if (!Number.isInteger(data.pid) || (data.pid as number) < 1) return { error: "invalid pid" };
 	return {
 		record: {
@@ -1435,13 +1654,24 @@ export function parsePersistedRelay(raw: string): { record: PersistedRelay } | {
 			cwd: typeof data.cwd === "string" ? data.cwd : "",
 			savedAt: typeof data.savedAt === "string" ? data.savedAt : "",
 			model,
+			stopped,
 			relay: {
 				maxSteps: relay.maxSteps as number,
 				sessionIds: ids as string[],
 				maxCost: relay.maxCost as number | undefined,
 				spent: relay.spent,
-				paused: relay.paused === true ? true : undefined,
-				pending: pending ? { prompt: (pending as { prompt: string }).prompt } : undefined,
+				waiting,
+				backgroundTasks: backgroundTasks.length > 0 ? backgroundTasks : undefined,
+				backgroundNotifications: relay.backgroundNotifications as string[] | undefined,
+				pending: pending
+					? {
+						prompt: (pending as { prompt: string }).prompt,
+						...((pending as { deliverHere?: unknown }).deliverHere === true ? { deliverHere: true as const } : {}),
+						...(typeof (pending as { targetSessionId?: unknown }).targetSessionId === "string"
+							? { targetSessionId: (pending as { targetSessionId: string }).targetSessionId }
+							: {}),
+					}
+					: undefined,
 				nextModel,
 			},
 		},
@@ -1518,6 +1748,7 @@ export function relayOwnedByOtherProcess(
 ): { record: PersistedRelay } | undefined {
 	const saved = loadPersistedRelay(relayStatePath(cwd, agentDir));
 	if (!saved || "error" in saved) return undefined;
+	if (saved.record.stopped) return undefined;
 	const { pid, startedAt } = saved.record;
 	return pid !== process.pid && isRelayOwnerAlive(pid, startedAt) ? saved : undefined;
 }
@@ -1533,37 +1764,51 @@ export function setRelayPersistence(target: typeof persistence): void {
 	persistence = target;
 }
 
-function persistRelay(relay: RelayState | undefined): void {
-	if (!persistence) return;
+function snapshotRelay(relay: RelayState, stopped?: RelayStopped): PersistedRelay | undefined {
+	if (!persistence) return undefined;
+	return {
+		version: 1,
+		pid: process.pid,
+		startedAt: ownStartTime(),
+		cwd: persistence.cwd,
+		savedAt: new Date().toISOString(),
+		model: persistence.model,
+		stopped,
+		relay: {
+			maxSteps: relay.maxSteps,
+			sessionIds: relay.sessionIds,
+			maxCost: relay.maxCost,
+			spent: relay.spent,
+			waiting: relay.waiting,
+			backgroundTasks: relay.backgroundTasks,
+			backgroundNotifications: relay.backgroundNotifications,
+			pending: relay.pending ? {
+				prompt: relay.pending.prompt,
+				deliverHere: relay.pending.deliverHere,
+				targetSessionId: relay.pending.targetSessionId,
+			} : undefined,
+			nextModel: relay.nextModel,
+		},
+	};
+}
+
+function persistRecord(record: PersistedRelay | undefined): boolean {
+	if (!persistence) return false;
 	const path = relayStatePath(persistence.cwd, persistence.agentDir);
+	const tmp = `${path}.${process.pid}.tmp`;
 	try {
-		if (!relay) {
+		if (!record) {
 			rmSync(path, { force: true });
-			return;
+			return true;
 		}
-		const record: PersistedRelay = {
-			version: 1,
-			pid: process.pid,
-			startedAt: ownStartTime(),
-			cwd: persistence.cwd,
-			savedAt: new Date().toISOString(),
-			model: persistence.model,
-			relay: {
-				maxSteps: relay.maxSteps,
-				sessionIds: relay.sessionIds,
-				maxCost: relay.maxCost,
-				spent: relay.spent,
-				paused: relay.paused,
-				pending: relay.pending ? { prompt: relay.pending.prompt } : undefined,
-				nextModel: relay.nextModel,
-			},
-		};
 		mkdirSync(dirname(path), { recursive: true });
-		const tmp = `${path}.${process.pid}.tmp`;
 		writeFileSync(tmp, JSON.stringify(record, null, 2));
 		renameSync(tmp, path);
+		return true;
 	} catch {
 		// Persistence is a convenience; the relay itself must never fail because of it.
+		try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+		return false;
 	}
 }
 
@@ -1571,7 +1816,33 @@ export function writeRelay(relay: RelayState | undefined): void {
 	const store = globalThis as Record<string, unknown>;
 	if (relay) store[RELAY_KEY] = relay;
 	else delete store[RELAY_KEY];
-	persistRelay(relay);
+	delete store[RELAY_STOPPED_KEY];
+	persistRecord(relay ? snapshotRelay(relay) : undefined);
+}
+
+function stopRelaySnapshot(relay: RelayState, stopped: RelayStopped): { durable: boolean; recoverable: boolean } {
+	const store = globalThis as Record<string, unknown>;
+	delete store[RELAY_KEY];
+	const record = snapshotRelay(relay, stopped);
+	if (record) store[RELAY_STOPPED_KEY] = record;
+	else delete store[RELAY_STOPPED_KEY];
+	const durable = persistRecord(record);
+	if (record && !durable) {
+		// Do not leave an older active record claiming that this live process still
+		// owns the relay. The in-memory snapshot remains resumable in this process.
+		try { rmSync(relayStatePath(record.cwd, persistence?.agentDir), { force: true }); } catch { /* best effort */ }
+	}
+	return { durable, recoverable: record !== undefined };
+}
+
+/** The newest stopped snapshot for this directory, whether in-process or recovered from disk. */
+export function readStoppedRelay(cwd: string): { record: PersistedRelay } | undefined {
+	const memory = (globalThis as Record<string, unknown>)[RELAY_STOPPED_KEY] as PersistedRelay | undefined;
+	const inProcess = memory?.stopped && memory.cwd === cwd ? memory : undefined;
+	const saved = loadPersistedRelay(relayStatePath(cwd));
+	const disk = saved && "record" in saved ? saved.record : undefined;
+	if (inProcess && (!disk || inProcess.savedAt > disk.savedAt)) return { record: inProcess };
+	return disk?.stopped ? { record: disk } : undefined;
 }
 
 export type RelayArgs =
@@ -1579,7 +1850,7 @@ export type RelayArgs =
 	| { kind: "off" }
 	| { kind: "status" }
 	| { kind: "model"; spec: string }
-	| { kind: "resume" }
+	| { kind: "resume"; maxSteps?: number; maxCost?: number }
 	| { kind: "error"; error: string };
 
 const RELAY_USAGE =
@@ -1604,7 +1875,36 @@ export function parseRelayArgs(args: string): RelayArgs {
 	if (first === undefined || first === "status") return { kind: "status" };
 	if (first === "off") return { kind: "off" };
 	if (first === "model") return { kind: "model", spec: tokens.slice(1).join(" ") };
-	if (first === "resume") return { kind: "resume" };
+	if (first === "resume") {
+		let maxSteps: number | undefined;
+		let maxCost: number | undefined;
+		let i = 1;
+		while (i < tokens.length) {
+			const steps = flagValue(tokens, i, "--max-steps");
+			if (steps) {
+				if (steps.raw === undefined || !/^\d+$/.test(steps.raw) || Number(steps.raw) < 1) {
+					return { kind: "error", error: "--max-steps needs a positive whole number, e.g. --max-steps 8" };
+				}
+				maxSteps = Number(steps.raw);
+				i += steps.used;
+				continue;
+			}
+			const cost = flagValue(tokens, i, "--max-cost");
+			if (cost) {
+				const amount = cost.raw !== undefined && /^\$?\d+(\.\d+)?$/.test(cost.raw) ? Number(cost.raw.replace("$", "")) : NaN;
+				if (!(amount > 0)) return { kind: "error", error: "--max-cost needs a positive dollar amount, e.g. --max-cost 5" };
+				maxCost = amount;
+				i += cost.used;
+				continue;
+			}
+			return { kind: "error", error: "resume accepts only --max-steps N and --max-cost USD" };
+		}
+		return {
+			kind: "resume",
+			...(maxSteps !== undefined ? { maxSteps } : {}),
+			...(maxCost !== undefined ? { maxCost } : {}),
+		};
+	}
 
 	let maxSteps: number | undefined;
 	let maxCost: number | undefined;
@@ -1666,30 +1966,38 @@ export type RelaySignal =
 	| { kind: "none" }
 	| { kind: "invalid"; reason: string };
 
-/** Replace fenced code blocks with a blank so quoted syntax never counts as a tag. */
-function stripCodeFences(text: string): string {
-	return text.replace(/^[ \t]*(```|~~~)[^\n]*\n[\s\S]*?(?:\n[ \t]*\1[^\n]*|$)/gm, "");
+/** Mask fenced code without moving offsets, so quoted syntax never counts as a tag. */
+function maskCodeFences(text: string): string {
+	return text.replace(/^[ \t]*(```|~~~)[^\n]*\n[\s\S]*?(?:\n[ \t]*\1[^\n]*|$)/gm, (fence) => fence.replace(/[^\n]/g, " "));
 }
 
 /**
- * Classify a final assistant message. A hand-off only counts when the tag
- * wraps the *whole* message, outside code fences; a tag anywhere else is
- * `invalid` (the relay stops) rather than ignored, so a half-formed hand-off
- * never silently ends the relay as "done".
+ * Classify a final assistant message. One signal outside code fences counts
+ * even with a user-facing summary around it. The signal's body is read from
+ * the original text so fenced examples inside a hand-off survive intact.
  */
 export function parseRelaySignal(text: string): RelaySignal {
-	const trimmed = text.trim();
-	if (/^<hand-off\s+done\s*\/>$/.test(trimmed)) return { kind: "done" };
-	const whole = /^<hand-off(?:\s+(stop|pause))?>([\s\S]*)<\/hand-off>$/.exec(trimmed);
-	if (whole) {
-		const word = whole[1] as "stop" | "pause" | undefined;
-		const body = whole[2].trim();
+	const masked = maskCodeFences(text.trim());
+	const done = /<hand-off\s+done\s*\/>/.exec(masked);
+	if (done) {
+		const elsewhere = `${masked.slice(0, done.index)} ${masked.slice(done.index + done[0].length)}`;
+		if (/<hand-off(\s[^>]*)?\/?>|<\/hand-off>/.test(elsewhere)) {
+			return { kind: "invalid", reason: "more than one hand-off signal appears" };
+		}
+		return { kind: "done" };
+	}
+	const signal = /<hand-off(?:\s+(stop|pause))?>[\s\S]*<\/hand-off>/.exec(masked);
+	if (signal) {
+		const word = signal[1] as "stop" | "pause" | undefined;
+		const bodyStart = masked.indexOf(">", signal.index) + 1;
+		const bodyEnd = signal.index + signal[0].length - "</hand-off>".length;
+		const body = text.trim().slice(bodyStart, bodyEnd).trim();
 		if (!body) return { kind: "invalid", reason: `the hand-off ${word ? `${word} reason` : "block"} is empty` };
 		// A literal tag inside the body (hand-offs often explain the syntax) is just text.
 		return word ? { kind: word, reason: body } : { kind: "hand-off", body };
 	}
-	if (/<hand-off(\s[^>]*)?\/?>|<\/hand-off>/.test(stripCodeFences(trimmed))) {
-		return { kind: "invalid", reason: "a hand-off tag appears, but does not wrap the whole final message" };
+	if (/<hand-off(\s[^>]*)?\/?>|<\/hand-off>/.test(masked)) {
+		return { kind: "invalid", reason: "a hand-off tag is incomplete or malformed" };
 	}
 	return { kind: "none" };
 }
@@ -1724,13 +2032,15 @@ export function sumUsage(messages: ReadonlyArray<{ role: string; usage?: unknown
 function signalInstructions(step: number, maxSteps: number): string[] {
 	const last = step >= maxSteps;
 	return [
-		"End with exactly one of these as your **entire** final message (nothing before or after, no code fence):",
+		"End with exactly one of these relay signals (not in a code fence). A short user-facing summary may precede it:",
 		...(last
 			? ["- This is the last step the relay allows (no more hand-offs), so a `<hand-off>` will be refused."]
 			: ["- `<hand-off>…</hand-off>`: what you did, what is next, and any gotchas."]),
 		"- `<hand-off done/>`: the work is complete.",
 		"- `<hand-off pause>question</hand-off>`: you need an answer from the user. The relay waits in this session and continues when you next finish, after they reply.",
 		"- `<hand-off stop>reason</hand-off>`: you cannot continue (blocked, failing). The relay ends and the user sees your reason.",
+		"Do not emit `hand-off`, `done`, `pause`, or `stop` merely because you are waiting for a background subagent. End the turn normally without a relay signal; its completion notification will let you continue.",
+		"For a `<hand-off>` block, put everything the next agent needs inside the tags; prose outside them is not carried forward.",
 	];
 }
 
@@ -1807,7 +2117,18 @@ export function decideBudgetAction(
 }
 
 export interface RelayDecisionInput {
-	relay: Pick<RelayState, "maxSteps" | "sessionIds" | "maxCost" | "spent" | "nudged" | "pending">;
+	relay: Pick<
+		RelayState,
+		| "maxSteps"
+		| "sessionIds"
+		| "maxCost"
+		| "spent"
+		| "nudged"
+		| "pending"
+		| "waiting"
+		| "backgroundTasks"
+		| "backgroundNotifications"
+	>;
 	/** The session whose agent just settled. */
 	sessionId: string;
 	aborted: boolean;
@@ -1819,9 +2140,12 @@ export interface RelayDecisionInput {
 
 export type RelayDecision =
 	| { kind: "ignore" }
-	| { kind: "stop"; reason: string; level: "info" | "warning" | "error" }
+	| { kind: "stop"; reason: string; level: "info" | "warning" | "error"; limit?: RelayStopped["limit"] }
 	| { kind: "pause"; reason: string }
+	| { kind: "wait" }
+	| { kind: "idle"; reason: string }
 	| { kind: "nudge"; problem: string }
+	| { kind: "attention"; reason: string }
 	| { kind: "hop"; body: string; step: number; spent: number };
 
 /** What the relay should do now that an agent settled. Pure: no I/O, no ctx. */
@@ -1835,6 +2159,18 @@ export function decideRelayAction(input: RelayDecisionInput): RelayDecision {
 	if (last.stopReason !== "stop") {
 		return { kind: "stop", reason: `the final message ended with "${last.stopReason ?? "unknown"}"`, level: "error" };
 	}
+	// A human pause or protocol-attention wait cannot be cleared by an
+	// unrelated notification-driven run. Only another turn or `resume` retries it.
+	if (relay.waiting?.kind === "user" || relay.waiting?.kind === "attention") return { kind: "ignore" };
+	// An idle main agent with outstanding background work has not reached a
+	// relay boundary at all. This takes precedence over every model-emitted
+	// signal, including `done` and `stop`: those results are still unavailable.
+	if (
+		(relay.backgroundTasks?.length ?? 0) > 0 ||
+		awaitingBackgroundNotification(relay) ||
+		relay.waiting?.kind === "background" ||
+		relay.waiting?.kind === "unsignalled"
+	) return { kind: "wait" };
 
 	const signal = parseRelaySignal(last.text);
 	if (signal.kind === "done") return { kind: "stop", reason: "the agent signalled the work is done", level: "info" };
@@ -1848,15 +2184,23 @@ export function decideRelayAction(input: RelayDecisionInput): RelayDecision {
 			kind: "stop",
 			reason: `spent $${spent.toFixed(2)} of the $${relay.maxCost.toFixed(2)} limit, too little left to start another session`,
 			level: "warning",
+			limit: "cost",
 		};
 	}
-	if (signal.kind === "none" || signal.kind === "invalid") {
-		const problem = signal.kind === "none" ? "it has no <hand-off> tag" : signal.reason;
-		if (relay.nudged) return { kind: "stop", reason: `${problem} (after one reminder)`, level: "warning" };
-		return { kind: "nudge", problem };
+	// With no signal, the agent may be waiting on any background-task system,
+	// not just one we integrate with. Stay armed and let any later turn retry.
+	if (signal.kind === "none") return { kind: "idle", reason: "the final message has no <hand-off> tag" };
+	if (signal.kind === "invalid") {
+		if (relay.nudged) return { kind: "attention", reason: `${signal.reason} (after one reminder)` };
+		return { kind: "nudge", problem: signal.reason };
 	}
 	if (step >= relay.maxSteps) {
-		return { kind: "stop", reason: `reached the limit of ${relay.maxSteps} hand-offs; the agent asked for another hand-off`, level: "warning" };
+		return {
+			kind: "stop",
+			reason: `reached the limit of ${relay.maxSteps} hand-offs; the agent asked for another hand-off`,
+			level: "warning",
+			limit: "steps",
+		};
 	}
 	return { kind: "hop", body: signal.body, step, spent };
 }
@@ -1877,6 +2221,7 @@ export default function (pi: ExtensionAPI) {
 	let awaitingHandoff = false;
 	let capturedPrompt: string | undefined;
 	let flowInProgress = false;
+	let currentSessionId: string | undefined;
 	// Config file contents, refreshed on every `session_start` (the file is read
 	// once per session, not per hand-off). The pi CLI flag is read per hand-off
 	// so it works even if a command somehow runs before `session_start`.
@@ -1981,10 +2326,27 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Make lifecycle changes visible to both the user and the current agent. */
+	function announceRelayState(ctx: ExtensionContext, content: string): void {
+		try {
+			pi.sendMessage({ customType: RELAY_STATE_TYPE, content, display: true }, { triggerTurn: false });
+		} catch {
+			// Same-session replacement can make this context stale synchronously.
+		}
+	}
+
 	/** Ends the relay and tells the user why, with the total spent. */
-	function stopRelay(ctx: ExtensionContext, reason: string, level: "info" | "warning" | "error"): void {
+	function stopRelay(
+		ctx: ExtensionContext,
+		reason: string,
+		level: "info" | "warning" | "error",
+		limit?: RelayStopped["limit"],
+	): void {
+		takeHandoff();
 		const relay = readRelay();
-		writeRelay(undefined);
+		const recovery = relay
+			? stopRelaySnapshot(relay, { reason, level, at: new Date().toISOString(), limit })
+			: undefined;
 		let where = "";
 		if (relay) {
 			// While a hand-off is pending, `spent` already includes this session.
@@ -2006,17 +2368,171 @@ export default function (pi: ExtensionAPI) {
 				// The session may already be replaced; the notification still goes out.
 			}
 		}
-		ctx.ui.notify(`Hand-off relay stopped${where}: ${reason}`, level);
+		const recoveryAction = recovery?.durable
+			? " `/hand-off-relay resume` reopens it; `off` discards the stopped snapshot."
+			: recovery?.recoverable
+				? " The recovery file could not be saved, so `resume` works only in this pi process; `off` discards the in-memory snapshot."
+				: relay ? " No recovery snapshot could be saved; start a new relay if more work is needed." : "";
+		ctx.ui.notify(
+			`Hand-off relay stopped${where}: ${reason}${recoveryAction}`,
+			recovery && !recovery.durable ? "warning" : level,
+		);
+		announceRelayState(
+			ctx,
+			`The hand-off relay is stopped (${reason}). Its protocol is no longer active; further <hand-off> signals have no effect unless the user resumes this relay or explicitly arms another one.`,
+		);
 	}
 
-	/** Stops the relay if the internal advance command never started (it was not dispatched). */
+	/** Keep a failed advance recoverable: its prompt remains pending for `resume`. */
+	function failAdvance(ctx: ExtensionContext, reason: string): void {
+		const relay = readRelay();
+		if (!relay?.pending) return stopRelay(ctx, reason, "error");
+		writeRelay({
+			...relay,
+			pending: {
+				prompt: relay.pending.prompt,
+				deliverHere: relay.pending.deliverHere,
+				targetSessionId: relay.pending.targetSessionId,
+			},
+			waiting: { kind: "attention", reason },
+		});
+		ctx.ui.notify(
+			`Hand-off relay could not advance: ${reason}. \`/hand-off-relay resume\` retries the saved hand-off; \`off\` stops it, and another \`off\` discards the stopped snapshot.`,
+			"error",
+		);
+		announceRelayState(ctx, `The relay could not advance: ${reason}. Its hand-off is still saved. The user can resume to retry or stop the relay.`);
+	}
+
+	/** Pauses the relay if the internal advance command never started. */
 	function watchAdvance(ctx: ExtensionContext, pending: object): void {
 		setTimeout(() => {
 			const relay = readRelay();
 			if (relay?.pending !== pending || relay.pending.started) return;
-			stopRelay(ctx, "the hand-off did not start (the internal advance command never ran)", "error");
+			failAdvance(ctx, "the hand-off did not start (the internal advance command never ran)");
 		}, ADVANCE_WATCHDOG_MS).unref?.();
 	}
+
+	/** A swallowed send error or handled input must not strand a blank session. */
+	function watchDelivery(ctx: ExtensionContext, pending: object): void {
+		setTimeout(() => {
+			const relay = readRelay();
+			if (relay?.pending !== pending) return;
+			failAdvance(ctx, "the hand-off prompt was not accepted (check the model, auth, or another input handler)");
+		}, ADVANCE_WATCHDOG_MS).unref?.();
+	}
+
+	// Optional adapter: pi-subagents supplies precise outstanding-task state.
+	// Correctness does not depend on it: unsignalled idle and any later turn are
+	// the generic fallback for other background-task and notification systems.
+	const SUBAGENTS_SOURCE = "pi-subagents";
+	const busSubscriptions: Array<() => void> = [];
+	const onBus = (channel: string, handler: (data: unknown) => void): void => {
+		busSubscriptions.push(pi.events.on(channel, handler));
+	};
+	pi.on("session_shutdown", () => {
+		for (const unsubscribe of busSubscriptions.splice(0)) unsubscribe();
+	});
+	const asSubagent = (data: unknown, fallbackBackground: boolean): RelayBackgroundTask | undefined => {
+		if (!isRecord(data) || typeof data.id !== "string" || !data.id) return undefined;
+		// RPC, scheduler, and direct-mention spawns emit `started` without
+		// `created`; `started` alone cannot distinguish them from foreground Agent
+		// calls. The documented manager registry can: blocking calls have an inline
+		// result, while every non-blocking top-level spawn needs its notification.
+		let background = fallbackBackground;
+		try {
+			const manager = (globalThis as Record<symbol, unknown>)[Symbol.for("pi-subagents:manager")];
+			if (isRecord(manager) && typeof manager.getRecord === "function") {
+				const record = (manager.getRecord as (id: string) => unknown)(data.id);
+				if (isRecord(record)) background = record.blocking !== true;
+			}
+		} catch {
+			// The lifecycle-event fallback remains usable if an integration changes.
+		}
+		return {
+			id: data.id,
+			type: typeof data.type === "string" ? data.type : "agent",
+			description: typeof data.description === "string" && data.description ? data.description : data.id,
+			source: SUBAGENTS_SOURCE,
+			background,
+		};
+	};
+	const updateBackgroundTask = (task: RelayBackgroundTask | undefined): void => {
+		if (!task) return;
+		const relay = readRelay();
+		if (!relay || relay.sessionIds.at(-1) !== currentSessionId) return;
+		writeRelay(trackRelayBackgroundTask(relay, task));
+	};
+	onBus("subagents:created", (data) => updateBackgroundTask(asSubagent(data, true)));
+	onBus("subagents:started", (data) => updateBackgroundTask(asSubagent(data, false)));
+	const finishSubagent = (data: unknown): void => {
+		if (!isRecord(data) || typeof data.id !== "string") return;
+		const relay = readRelay();
+		if (!relay || relay.sessionIds.at(-1) !== currentSessionId) return;
+		writeRelay(completeRelayBackgroundTask(relay, SUBAGENTS_SOURCE, data.id));
+	};
+	onBus("subagents:completed", finishSubagent);
+	onBus("subagents:failed", finishSubagent);
+
+	// A result is released only when the main agent actually receives it. The
+	// outbox may suppress a notification after get_subagent_result or RPC consume.
+	// This event is also the first reliable delivery acknowledgment: `input`
+	// fires before model/auth validation and before all input handlers finish.
+	pi.on("message_start", (event) => {
+		if (event.message.role === "user") {
+			const attempt = readDeliveryAttempt();
+			if (
+				attempt && attempt.targetSessionId === currentSessionId &&
+				messageText(event.message) === attempt.prompt
+			) finishDelivery(attempt, false);
+			const relay = readRelay();
+			const pending = relay?.pending;
+			if (
+				relay && pending?.deliverHere && typeof currentSessionId === "string" &&
+				pending.targetSessionId === currentSessionId && messageText(event.message) === pending.prompt
+			) {
+				writeRelay({
+					...relay,
+					sessionIds: relay.sessionIds.at(-1) === currentSessionId
+						? relay.sessionIds
+						: [...relay.sessionIds, currentSessionId],
+					pending: undefined,
+					waiting: undefined,
+					nudged: false,
+					warned: undefined,
+				});
+			}
+			return;
+		}
+		const message = event.message as { role?: string; customType?: string; details?: unknown };
+		if (message.role !== "custom" || message.customType !== "subagent-notification") return;
+		const relay = readRelay();
+		if (!relay || relay.sessionIds.at(-1) !== currentSessionId) return;
+		const details = message.details;
+		if (!isRecord(details)) return;
+		const ids = [details.id, ...(Array.isArray(details.others) ? details.others.map((other) => isRecord(other) ? other.id : undefined) : [])]
+			.filter((id): id is string => typeof id === "string" && id !== "");
+		if (ids.length === 0) return;
+		clearBackgroundNotifications(relay, ids);
+		writeRelay(relay);
+	});
+	pi.on("tool_execution_end", (event) => {
+		if (event.toolName !== "get_subagent_result" || event.isError) return;
+		const relay = readRelay();
+		if (!relay || relay.sessionIds.at(-1) !== currentSessionId || !awaitingBackgroundNotification(relay)) return;
+		const content = (event.result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
+		const text = Array.isArray(content) ? content.map((part) => part.text ?? "").join("\n") : "";
+		const id = /^Agent:\s*(\S+)\s*$/m.exec(text)?.[1];
+		if (!id || !relay.backgroundNotifications?.includes(id)) return;
+		clearBackgroundNotifications(relay, [id]);
+		writeRelay(relay);
+	});
+	onBus("subagents:rpc:consume", (data) => {
+		if (!isRecord(data) || typeof data.agentId !== "string") return;
+		const relay = readRelay();
+		if (!relay || relay.sessionIds.at(-1) !== currentSessionId || !relay.backgroundNotifications?.includes(data.agentId)) return;
+		clearBackgroundNotifications(relay, [data.agentId]);
+		writeRelay(relay);
+	});
 
 	pi.on("agent_settled", async (event, ctx) => {
 		const relay = readRelay();
@@ -2036,21 +2552,60 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		if (decision.kind === "ignore") return;
-		if (decision.kind === "stop") return stopRelay(ctx, decision.reason, decision.level);
-		if (decision.kind === "pause") {
-			// The relay stays armed on this session; the next settle re-evaluates it.
-			writeRelay({ ...relay, paused: true, nudged: false });
+		if (decision.kind === "stop") return stopRelay(ctx, decision.reason, decision.level, decision.limit);
+		if (decision.kind === "wait") {
+			const alreadyWaiting = relay.waiting?.kind === "background";
+			writeRelay({ ...relay, waiting: { kind: "background" } });
+			if (!alreadyWaiting) {
+				const count = relay.backgroundTasks?.length ?? 0;
+				const detail = count > 0
+					? `${count} background task${count === 1 ? " is" : "s are"} still running`
+					: "a background completion notification is still pending";
+				ctx.ui.notify(
+					`Hand-off relay waiting at step ${relayStep(relay)} of ${relay.maxSteps}: ${detail}. A notification continues it automatically; \`/hand-off-relay status\` inspects it and \`off\` stops it.`,
+					"info",
+				);
+				announceRelayState(ctx, `The relay is waiting for background work (${detail}). Do not emit a hand-off, pause, stop, or done signal until the results arrive.`);
+			}
+			return;
+		}
+		if (decision.kind === "idle") {
+			writeRelay({ ...relay, waiting: { kind: "unsignalled", reason: decision.reason } });
 			ctx.ui.notify(
-				`Hand-off relay paused at step ${relayStep(relay)} of ${relay.maxSteps}: ${decision.reason}\nReply in this session and the relay continues when the agent finishes. \`/hand-off-relay off\` cancels it.`,
-				"warning",
+				`Hand-off relay is idle at step ${relayStep(relay)} of ${relay.maxSteps}: ${decision.reason}. It may be waiting for background work; any notification or reply lets it continue. \`/hand-off-relay resume\` asks for a signal now; \`off\` stops it.`,
+				"info",
+			);
+			announceRelayState(
+				ctx,
+				"The relay is still armed but idle because your last message had no relay signal. If you are waiting for background work, continue when its notification arrives. Otherwise wait for the user; they can reply or resume the relay.",
 			);
 			return;
 		}
-		if (relay.paused) writeRelay({ ...relay, paused: false });
+		if (decision.kind === "pause") {
+			writeRelay({ ...relay, waiting: { kind: "user", reason: decision.reason }, nudged: false });
+			ctx.ui.notify(
+				`Hand-off relay paused at step ${relayStep(relay)} of ${relay.maxSteps}: ${decision.reason}\nReply in this session or run \`/hand-off-relay resume\`; unrelated notifications will not advance the relay. \`off\` cancels it.`,
+				"warning",
+			);
+			announceRelayState(ctx, `The relay is paused for a user answer: ${decision.reason}. Do not advance it until the user replies or resumes it.`);
+			return;
+		}
+		if (decision.kind === "attention") {
+			writeRelay({ ...relay, waiting: { kind: "attention", reason: decision.reason } });
+			ctx.ui.notify(
+				`Hand-off relay needs attention at step ${relayStep(relay)} of ${relay.maxSteps}: ${decision.reason}. Reply with guidance or run \`/hand-off-relay resume\`; \`off\` stops it.`,
+				"warning",
+			);
+			announceRelayState(
+				ctx,
+				`The relay needs user intervention: ${decision.reason}. Do not keep autonomously repeating hand-off tags. A user reply, a later notification-driven turn, or /hand-off-relay resume will let you continue.`,
+			);
+			return;
+		}
 		if (decision.kind === "nudge") {
-			writeRelay({ ...relay, paused: false, nudged: true });
+			writeRelay({ ...relay, waiting: undefined, nudged: true });
 			const step = relayStep(relay);
-			pi.sendUserMessage(buildRelayNudge(step, relay.maxSteps, decision.problem));
+			void pi.sendUserMessage(buildRelayNudge(step, relay.maxSteps, decision.problem));
 			return;
 		}
 
@@ -2095,12 +2650,40 @@ export default function (pi: ExtensionAPI) {
 			prompt: buildRelayPrompt(decision.body, { step: step + 1, maxSteps: relay.maxSteps, fromSessionId }),
 		};
 		setRelayPersistence({ cwd: ctx.cwd, model: carried });
-		writeRelay({ ...relay, spent, nudged: false, nextModel: undefined, pending });
+		writeRelay({
+			...relay,
+			spent,
+			nudged: false,
+			waiting: undefined,
+			backgroundTasks: undefined,
+			backgroundNotifications: undefined,
+			nextModel: undefined,
+			pending,
+		});
 		writeHandoff({ provider: carried.provider, modelId: carried.modelId, thinkingLevel: carried.thinkingLevel });
 		// Event contexts cannot replace the session; a command context can, so
 		// hand the work to the internal command (processed after settled handlers).
 		pi.sendUserMessage(`/${RELAY_COMMAND}`, { expandPromptTemplates: true });
 		watchAdvance(ctx, pending);
+	});
+
+	// Any later turn is enough to retry an unsignalled/attention wait, whatever
+	// extension supplied the notification. Explicit user pauses are different:
+	// only actual human input (or the resume command) may clear those.
+	pi.on("turn_start", (_event, ctx) => {
+		const relay = readRelay();
+		if (!relay || relay.sessionIds.at(-1) !== ctx.sessionManager.getSessionId()) return;
+		if (awaitingBackgroundNotification(relay) || !relay.waiting || relay.waiting.kind === "user") return;
+		writeRelay(continueRelayForTurn(relay));
+	});
+	pi.on("input", (event, ctx) => {
+		const relay = readRelay();
+		// sendUserMessage() and RPC submissions also emit `input`; they are not
+		// evidence that the human answered a pause or approved another correction.
+		if (event.source !== "interactive") return;
+		if (!relay || relay.sessionIds.at(-1) !== ctx.sessionManager.getSessionId()) return;
+		if (!relay.waiting && !relay.nudged && !awaitingBackgroundNotification(relay)) return;
+		writeRelay(continueRelayForUser(relay));
 	});
 
 	// Cost guard while a step runs: escalating steering messages, then a hard abort.
@@ -2111,7 +2694,7 @@ export default function (pi: ExtensionAPI) {
 
 		const action = decideBudgetAction(relay, sessionCost(ctx));
 		if (action.kind === "abort") {
-			stopRelay(ctx, `${action.reason}; aborted session ${ctx.sessionManager.getSessionId()}`, "warning");
+			stopRelay(ctx, `${action.reason}; aborted session ${ctx.sessionManager.getSessionId()}`, "warning", "cost");
 			ctx.abort();
 			return;
 		}
@@ -2131,89 +2714,214 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("No autonomous hand-off relay is waiting to advance", "warning");
 				return;
 			}
+			if (pending.started || pending.deliverHere) return;
 			pending.started = true;
 			try {
 				const result = await ctx.newSession({
 					withSession: async (next) => {
-						// Retarget the relay at the new session before the first prompt runs.
+						// `off` may have run while session replacement was in flight. Never
+						// resurrect a stopped relay or overwrite a different relay.
+						if (readRelay()?.pending !== pending) return;
+						// Do not commit the replacement as a relay step until its prompt
+						// actually starts. An unwritten blank session is then recoverable
+						// from the previous session after a restart.
 						const nextId = next.sessionManager.getSessionId();
 						if (relay.sessionIds.includes(nextId)) {
 							stopRelay(next, `session ${nextId} is already in the relay`, "error");
 							return;
 						}
-						writeRelay({
-							maxSteps: relay.maxSteps,
-							maxCost: relay.maxCost,
-							spent: relay.spent,
-							sessionIds: [...relay.sessionIds, nextId],
-						});
+						const claim = claimDelivery(next.cwd, nextId, pending.prompt);
+						if (!claim.attempt) return failAdvance(next, claim.error!);
+						const delivery = { prompt: pending.prompt, deliverHere: true as const, targetSessionId: nextId };
+						writeRelay({ ...relay, pending: delivery, waiting: undefined, nudged: false, warned: undefined });
+						watchDelivery(next, delivery);
 						// Do not await: the call may resolve only when the whole run ends.
-						next.sendUserMessage(pending.prompt).catch((err: unknown) => {
-							stopRelay(next, `could not send the hand-off prompt: ${messageOf(err)}`, "error");
-						});
+						next.sendUserMessage(pending.prompt).then(
+							() => {
+								if (readDeliveryAttempt() === claim.attempt) finishDelivery(claim.attempt!, true);
+								if (readRelay()?.pending === delivery) {
+									failAdvance(next, "the hand-off send finished without starting its prompt (another input handler may have handled it)");
+								}
+							},
+							(err: unknown) => {
+								finishDelivery(claim.attempt!, true);
+								if (readRelay()?.pending === delivery) {
+									failAdvance(next, `could not send the hand-off prompt in the new session: ${messageOf(err)}`);
+								}
+							},
+						);
 					},
 				});
 				takeHandoff();
-				if (result.cancelled) stopRelay(ctx, "session replacement was cancelled", "warning");
+				if (result.cancelled) failAdvance(ctx, "session replacement was cancelled");
 			} catch (err) {
 				takeHandoff();
-				stopRelay(ctx, `hand-off failed: ${messageOf(err)}`, "error");
+				if (readRelay()?.pending) failAdvance(ctx, `hand-off failed: ${messageOf(err)}`);
 			}
 		},
 	});
 
-	/**
-	 * `/hand-off-relay resume`: continue a relay that was interrupted (crash or
-	 * quit) from its persisted state. A hand-off that was extracted but never
-	 * started is replayed into a new session; otherwise the relay re-arms on
-	 * the session it was interrupted in, which the user must have open.
-	 */
-	async function resumeRelay(ctx: ExtensionCommandContext, active: RelayState | undefined): Promise<void> {
-		if (active) {
-			return ctx.ui.notify("A hand-off relay is already armed in this process. `/hand-off-relay off` clears it first.", "warning");
+	/** Resume an active wait, an interrupted relay, or a stopped snapshot. */
+	async function resumeRelay(
+		ctx: ExtensionCommandContext,
+		active: RelayState | undefined,
+		options: { maxSteps?: number; maxCost?: number },
+	): Promise<void> {
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (!active) {
+			const other = relayOwnedByOtherProcess(ctx.cwd);
+			if (other) return ctx.ui.notify(`${ownedElsewhereMessage(other.record)} Nothing to resume.`, "warning");
 		}
-		const other = relayOwnedByOtherProcess(ctx.cwd);
-		if (other) return ctx.ui.notify(`${ownedElsewhereMessage(other.record)} Nothing to resume.`, "warning");
-		const saved = loadPersistedRelay(relayStatePath(ctx.cwd));
-		if (!saved) return ctx.ui.notify("No interrupted hand-off relay to resume in this directory", "info");
-		if ("error" in saved) {
+		const saved = active ? undefined : (readStoppedRelay(ctx.cwd) ?? loadPersistedRelay(relayStatePath(ctx.cwd)));
+		if (!active && !saved) {
+			return ctx.ui.notify("No stopped or interrupted hand-off relay to resume in this directory", "info");
+		}
+		if (saved && "error" in saved) {
 			return ctx.ui.notify(`Could not read the saved relay (${saved.error}). \`/hand-off-relay off\` discards it.`, "error");
 		}
-		const { relay, model } = saved.record;
-		const last = relay.sessionIds.at(-1);
-		const sessionId = ctx.sessionManager.getSessionId();
-		setRelayPersistence({ cwd: ctx.cwd, model });
-
-		if (relay.pending) {
-			if (!model) {
-				return ctx.ui.notify("The saved relay has no model to carry over. `/hand-off-relay off` discards it.", "error");
+		const source = active ?? saved!.record.relay;
+		const stopped = saved && "record" in saved ? saved.record.stopped : undefined;
+		const model = active ? persistence?.model : saved!.record.model;
+		if (!active) setRelayPersistence({ cwd: ctx.cwd, model });
+		const relay: RelayState = {
+			...source,
+			maxSteps: options.maxSteps ?? source.maxSteps,
+			maxCost: options.maxCost ?? source.maxCost,
+		};
+		// A delivery that never started has not committed its replacement step.
+		// After a restart its blank session may not even exist on disk, so allow
+		// the previous session (or any other session) to replay a normal advance.
+		const recoveringUndelivered = relay.pending?.deliverHere === true &&
+			relay.pending.targetSessionId !== sessionId &&
+			(!active || active.waiting?.kind === "attention");
+		if (recoveringUndelivered && relay.pending) {
+			if (relay.pending.targetSessionId === undefined && relay.sessionIds.length > 1) {
+				// Compatibility with snapshots written before targetSessionId existed.
+				relay.sessionIds = relay.sessionIds.slice(0, -1);
 			}
-			const pending = { prompt: relay.pending.prompt };
-			// The handoff already carries the saved model; a staged switch must not
-			// fire a second time on the hop after next.
-			writeRelay({ ...relay, pending, nextModel: undefined });
-			writeHandoff({ provider: model.provider, modelId: model.modelId, thinkingLevel: model.thinkingLevel });
-			ctx.ui.notify(`Resuming hand-off relay: starting step ${relayStep(relay) + 1} of ${relay.maxSteps}`, "info");
-			pi.sendUserMessage(`/${RELAY_COMMAND}`, { expandPromptTemplates: true });
-			watchAdvance(ctx, pending);
-			return;
+			relay.pending = { prompt: relay.pending.prompt };
 		}
-
-		if (last !== sessionId) {
+		if (relay.maxSteps < relayStep(relay)) {
 			return ctx.ui.notify(
-				`The interrupted relay was working in session ${last}. Open it with /resume, then run \`/hand-off-relay resume\` there.`,
+				`--max-steps ${relay.maxSteps} is below the current step ${relayStep(relay)}; choose a larger limit to resume.`,
 				"warning",
 			);
 		}
-		if (!ctx.isIdle()) await ctx.waitForIdle();
-		writeRelay({ ...relay, paused: false, nudged: false, warned: undefined });
+		const last = relay.sessionIds.at(-1);
+		const deliveringHere = relay.pending?.deliverHere === true && relay.pending.targetSessionId === sessionId;
+		if (!recoveringUndelivered && !deliveringHere && last !== sessionId) {
+			const description = active ? "is waiting on" : stopped ? "stopped in" : "was working in";
+			return ctx.ui.notify(
+				`The relay ${description} session ${last}, not this one. Open that session with /resume, then run /hand-off-relay resume there.`,
+				"warning",
+			);
+		}
+		const currentSpend = source.pending ? source.spent : source.spent + sessionCost(ctx);
+		if (options.maxSteps !== undefined && options.maxSteps <= relayStep(relay)) {
+			return ctx.ui.notify(
+				`--max-steps must be greater than the current step ${relayStep(relay)} to allow another hand-off.`,
+				"warning",
+			);
+		}
+		if (options.maxCost !== undefined && options.maxCost <= currentSpend) {
+			return ctx.ui.notify(
+				`--max-cost must be greater than the $${currentSpend.toFixed(2)} already reported across the relay.`,
+				"warning",
+			);
+		}
+		if (relay.maxCost !== undefined && relay.maxCost <= currentSpend) {
+			return ctx.ui.notify(
+				`This relay has already reported $${currentSpend.toFixed(2)}, at or above its $${relay.maxCost.toFixed(2)} cap. Resume with --max-cost greater than the reported spend.`,
+				"warning",
+			);
+		}
+		if (stopped?.limit === "steps" && relay.maxSteps <= relayStep(relay)) {
+			return ctx.ui.notify(
+				`This relay stopped at its step limit. Resume with --max-steps greater than ${relayStep(relay)} to allow another hand-off.`,
+				"warning",
+			);
+		}
+		if (relay.pending && relay.maxCost !== undefined && relay.maxCost * NO_NEW_SESSION_AT <= currentSpend) {
+			const minimumForHop = currentSpend / NO_NEW_SESSION_AT;
+			return ctx.ui.notify(
+				`Starting the saved hand-off would cross the 95% new-session guard at $${currentSpend.toFixed(2)} spent. Resume with --max-cost greater than $${minimumForHop.toFixed(2)}.`,
+				"warning",
+			);
+		}
+		if (stopped?.limit === "cost") {
+			const minimumForHop = currentSpend / NO_NEW_SESSION_AT;
+			if (relay.maxCost === undefined || relay.maxCost * NO_NEW_SESSION_AT <= currentSpend) {
+				return ctx.ui.notify(
+					`This relay stopped after reporting $${currentSpend.toFixed(2)} in spend. Resume with --max-cost greater than $${minimumForHop.toFixed(2)} so the next hand-off stays below the 95% guard.`,
+					"warning",
+				);
+			}
+		}
+		if (relay.pending?.deliverHere) {
+			if (!ctx.isIdle()) {
+				return ctx.ui.notify("Wait for the current turn to finish before retrying the saved hand-off prompt", "info");
+			}
+			const claim = claimDelivery(ctx.cwd, sessionId, relay.pending.prompt);
+			if (!claim.attempt) return ctx.ui.notify(claim.error!, "warning");
+			const delivery = { prompt: relay.pending.prompt, deliverHere: true as const, targetSessionId: sessionId };
+			writeRelay({ ...relay, pending: delivery, waiting: undefined, nextModel: undefined, nudged: false, warned: undefined });
+			watchDelivery(ctx, delivery);
+			ctx.ui.notify("Retrying the saved hand-off prompt in this session", "info");
+			try {
+				await pi.sendUserMessage(delivery.prompt);
+			} catch (err) {
+				finishDelivery(claim.attempt, true);
+				if (readRelay()?.pending === delivery) {
+					failAdvance(ctx, `could not send the hand-off prompt: ${messageOf(err)}`);
+				}
+			}
+			return;
+		}
+		if (active?.pending && active.waiting?.kind !== "attention") {
+			return ctx.ui.notify("The relay is already advancing to its next session", "info");
+		}
+		if (relay.pending) {
+			if (!model) return ctx.ui.notify("The saved hand-off has no model to carry over. `/hand-off-relay off` stops it; another `off` discards the snapshot.", "error");
+			const pending = { prompt: relay.pending.prompt };
+			// The handoff already carries the saved model; a staged switch must not
+			// fire a second time on the hop after next.
+			writeRelay({ ...relay, pending, waiting: undefined, nextModel: undefined });
+			writeHandoff({ provider: model.provider, modelId: model.modelId, thinkingLevel: model.thinkingLevel });
+			ctx.ui.notify(`${stopped ? "Resuming stopped" : "Retrying"} hand-off into step ${relayStep(relay) + 1} of ${relay.maxSteps}`, "info");
+			void pi.sendUserMessage(`/${RELAY_COMMAND}`, { expandPromptTemplates: true });
+			watchAdvance(ctx, pending);
+			return;
+		}
+		const outstanding = relay.backgroundTasks?.length ?? 0;
+		if (
+			active && outstanding > 0 && relay.waiting?.kind === "background" &&
+			!awaitingBackgroundNotification(relay) && options.maxSteps === undefined && options.maxCost === undefined
+		) {
+			return ctx.ui.notify(
+				`The relay is still waiting for ${outstanding} background task${outstanding === 1 ? "" : "s"}; no resume is needed. \`/hand-off-relay status\` lists them and \`off\` stops the relay.`,
+				"info",
+			);
+		}
+		if (active && !ctx.isIdle()) return ctx.ui.notify("The relay is already running in this session", "info");
+		if (!active && !ctx.isIdle()) await ctx.waitForIdle();
+		writeRelay({
+			...relay,
+			waiting: undefined,
+			backgroundTasks: active ? relay.backgroundTasks : undefined,
+			backgroundNotifications: undefined,
+			nudged: false,
+			warned: undefined,
+		});
 		ctx.ui.notify(
 			`Hand-off relay resumed at step ${relayStep(relay)} of ${relay.maxSteps}, $${relay.spent.toFixed(2)} spent before this session. \`/hand-off-relay off\` stops it.`,
 			"info",
 		);
-		await pi.sendUserMessage(
-			`The relay was interrupted (the process exited). Continue where you left off.\n\n---\n\n${buildRelayProtocol(relayStep(relay), relay.maxSteps)}`,
-		);
+		const reason = stopped
+			? `The user resumed the relay after it stopped (${stopped.reason}). Reconsider that decision and continue from the current state, checking any unfinished background work rather than assuming its result.`
+			: active
+				? "The user resumed the relay. Continue where you left off, checking any unfinished background work rather than assuming its result."
+				: "The relay was interrupted (the process exited). Continue where you left off, checking any unfinished background work rather than assuming its result.";
+		await pi.sendUserMessage(`${reason}\n\n---\n\n${buildRelayProtocol(relayStep(relay), relay.maxSteps)}`);
 	}
 
 	/** Handles `/hand-off-relay model [provider/model[:level]]`: stage the next hop's model. */
@@ -2279,17 +2987,50 @@ export default function (pi: ExtensionAPI) {
 				const other = relayOwnedByOtherProcess(ctx.cwd);
 				if (other) return ctx.ui.notify(ownedElsewhereMessage(other.record), "info");
 				const saved = loadPersistedRelay(relayStatePath(ctx.cwd));
-				if (saved && "record" in saved) {
+				const stoppedRecord = readStoppedRelay(ctx.cwd)?.record;
+				const recovered = stoppedRecord ?? (saved && "record" in saved ? saved.record : undefined);
+				if (recovered) {
+					const r = recovered.relay;
+					const stopped = recovered.stopped;
 					return ctx.ui.notify(
-						`No hand-off relay is running, but one was interrupted at step ${relayStep(saved.record.relay)} of ${saved.record.relay.maxSteps}. \`/hand-off-relay resume\` continues it; \`/hand-off-relay off\` discards it.`,
+						stopped
+							? `Hand-off relay stopped at step ${relayStep(r)} of ${r.maxSteps}: ${stopped.reason} \`/hand-off-relay resume\` reopens it; \`off\` discards the stopped snapshot.`
+							: `No hand-off relay is running, but one was interrupted at step ${relayStep(r)} of ${r.maxSteps}. \`/hand-off-relay resume\` continues it; \`/hand-off-relay off\` discards it.`,
 						"info",
 					);
 				}
 				return ctx.ui.notify("No hand-off relay is active", "info");
 			}
+			const phase = relayPhase(relay);
 			const lines = [
-				`Hand-off relay ${relay.paused ? "paused" : "active"}: step ${relayStep(relay)} of ${relay.maxSteps}, $${relay.spent.toFixed(2)} spent before this session${relay.maxCost !== undefined ? ` (limit $${relay.maxCost.toFixed(2)})` : ""}`,
+				`Hand-off relay ${relayPhaseLabel(relay)}: step ${relayStep(relay)} of ${relay.maxSteps}, $${relay.spent.toFixed(2)} spent before this session${relay.maxCost !== undefined ? ` (limit $${relay.maxCost.toFixed(2)})` : ""}`,
 			];
+			const tasks = relay.backgroundTasks ?? [];
+			if (tasks.length > 0) {
+				lines.push(`Background tasks: ${tasks.map((task) => `${task.description} (${task.source}/${task.id})`).join(", ")}`);
+			}
+			if (phase === "running") {
+				lines.push("Next: the current agent works and eventually supplies a relay signal. Reply to steer it, or use `model` / `off`.");
+			} else if (phase === "background") {
+				lines.push(tasks.length > 0
+					? "Next: a completion notification resumes the agent automatically. `resume` is available after they finish; `off` stops the relay."
+					: "Next: wait for the completion notification. If it was lost, `resume` re-prompts this session; `off` stops the relay.");
+			} else if (phase === "unsignalled") {
+				lines.push(`Reason: ${relay.waiting?.kind === "unsignalled" ? relay.waiting.reason : "no relay signal"}`);
+				lines.push("Next: any notification or reply lets the agent continue. `resume` asks for a relay signal now; `off` stops it.");
+			} else if (phase === "user") {
+				lines.push(`Waiting for you: ${relay.waiting?.kind === "user" ? relay.waiting.reason : "the agent needs an answer"}`);
+				lines.push("Next: reply in this session or run `resume`. Unrelated notifications do not advance the relay; `off` stops it.");
+			} else if (phase === "attention") {
+				lines.push(`Problem: ${relay.waiting?.kind === "attention" ? relay.waiting.reason : "the relay needs guidance"}`);
+				lines.push("Next: reply with guidance or run `resume` to retry the protocol. `off` stops the relay.");
+			} else if (relay.pending?.deliverHere) {
+				lines.push(relay.pending.targetSessionId === sessionId
+					? "Next: this replacement session has not accepted the saved prompt. `resume` retries delivery; `off` stops recoverably."
+					: "Next: the replacement prompt has not started, so its session is not a committed step. `resume` replays the hand-off; `off` stops recoverably.");
+			} else {
+				lines.push("Next: the saved hand-off is advancing into a fresh session. `off` can cancel it before replacement.");
+			}
 			const staged = relay.nextModel;
 			const next = staged
 				? `${staged.provider}/${staged.modelId}${staged.thinkingLevel ? ` · ${staged.thinkingLevel}` : ""} (staged with /hand-off-relay model)`
@@ -2298,7 +3039,9 @@ export default function (pi: ExtensionAPI) {
 					: undefined;
 			if (next) lines.push(`Next hop: ${next}`);
 			if (relay.sessionIds.length > 1) lines.push(`Sessions: ${relay.sessionIds.join(" \u2192 ")}`);
-			if (relay.sessionIds.at(-1) !== sessionId) {
+			if (relay.pending?.deliverHere && relay.pending.targetSessionId !== sessionId) {
+				lines.push(`Delivery targeted session ${relay.pending.targetSessionId ?? "unknown"}, but that step is not committed. If it is unavailable, \`resume\` replays the hand-off from here.`);
+			} else if (!relay.pending?.deliverHere && relay.sessionIds.at(-1) !== sessionId) {
 				lines.push(`Waiting on session ${relay.sessionIds.at(-1)}, not this one. \`/hand-off-relay off\` clears it.`);
 			}
 			return ctx.ui.notify(lines.join("\n"), "info");
@@ -2307,17 +3050,28 @@ export default function (pi: ExtensionAPI) {
 			const other = relay ? undefined : relayOwnedByOtherProcess(ctx.cwd);
 			if (other) return ctx.ui.notify(`${ownedElsewhereMessage(other.record)} It can only be stopped from that process.`, "warning");
 			setRelayPersistence({ cwd: ctx.cwd, model: persistence?.model });
+			if (relay) return stopRelay(ctx, "disarmed by the user", "info");
+			const saved = loadPersistedRelay(relayStatePath(ctx.cwd));
+			const stopped = readStoppedRelay(ctx.cwd);
 			writeRelay(undefined);
-			ctx.ui.notify("Hand-off relay disarmed", "info");
+			ctx.ui.notify(
+				stopped
+					? "Stopped hand-off relay snapshot discarded"
+					: saved && "record" in saved ? "Interrupted hand-off relay discarded" : "No hand-off relay is active",
+				"info",
+			);
+			announceRelayState(ctx, "No hand-off relay is active. Its previous protocol has no effect unless the user resumes it or explicitly arms another relay.");
 			return;
 		}
 		if (parsed.kind === "model") return handleRelayModel(ctx, relay, parsed.spec);
 		if (flowInProgress) return ctx.ui.notify("A hand-off is already in progress", "warning");
-		if (parsed.kind === "resume") return resumeRelay(ctx, relay);
+		if (parsed.kind === "resume") return resumeRelay(ctx, relay, parsed);
 		if (!ctx.model) return ctx.ui.notify("/hand-off-relay: the current session has no model to carry over", "error");
 		if (relay?.sessionIds.at(-1) === sessionId) {
-			const how = relay.paused ? "paused, waiting for your reply" : "already running";
-			return ctx.ui.notify(`A relay is ${how} in this session. \`/hand-off-relay off\` stops it first.`, "warning");
+			return ctx.ui.notify(
+				`A relay is already present in this session (${relayPhaseLabel(relay)}). Use \`/hand-off-relay status\` to inspect it, \`resume\` to continue an idle relay, or \`off\` to stop it first.`,
+				"warning",
+			);
 		}
 		const other = relay ? undefined : relayOwnedByOtherProcess(ctx.cwd);
 		if (other) {
@@ -2326,7 +3080,9 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 			);
 		}
-		const interrupted = !relay && loadPersistedRelay(relayStatePath(ctx.cwd)) !== undefined;
+		const previous = !relay ? loadPersistedRelay(relayStatePath(ctx.cwd)) : undefined;
+		const stopped = !relay ? readStoppedRelay(ctx.cwd) : undefined;
+		const interrupted = !stopped && previous && "record" in previous && !previous.record.stopped;
 		if (!ctx.isIdle()) await ctx.waitForIdle();
 
 		// A relay waiting on some other session is stale (its session was left
@@ -2336,7 +3092,7 @@ export default function (pi: ExtensionAPI) {
 			model: { provider: ctx.model.provider, modelId: ctx.model.id, thinkingLevel: ctx.thinkingLevel },
 		});
 		writeRelay({ maxSteps: parsed.maxSteps, maxCost: parsed.maxCost, spent: 0, sessionIds: [sessionId] });
-		const stale = relay ? " Replaced a stale relay." : interrupted ? " Replaced an interrupted relay." : "";
+		const stale = relay ? " Replaced a stale relay." : interrupted ? " Replaced an interrupted relay." : stopped ? " Replaced a stopped relay." : "";
 		ctx.ui.notify(
 			`Hand-off relay armed: up to ${parsed.maxSteps} hand-offs${parsed.maxCost !== undefined ? `, $${parsed.maxCost.toFixed(2)} limit` : ", no cost limit"}, same model each hop unless you stage a switch with \`/hand-off-relay model\`.${stale} Agents run unattended with your full tool access. \`/hand-off-relay off\` stops it.`,
 			"info",
@@ -2364,7 +3120,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("hand-off-relay", {
 		description:
-			"Autonomous hand-off relay: /hand-off-relay --max-steps <N> [--max-cost USD] [task] lets agents hand off to each other for up to N hand-offs (the first agent is step 0); `model [provider/model[:level]]` stages the next hop's model; `off` disarms, `status` reports, `resume` continues an interrupted relay",
+			"Autonomous hand-off relay: /hand-off-relay --max-steps <N> [--max-cost USD] [task] lets agents hand off to each other for up to N hand-offs (the first agent is step 0); `model [provider/model[:level]]` stages the next hop's model; `off` stops an active relay or discards a stopped one; `status` reports the lifecycle state; `resume [--max-steps N] [--max-cost USD]` continues an idle, paused, failed-advance, stopped, or interrupted relay",
 		handler: async (args, ctx) => handleRelayCommand(args, ctx),
 	});
 
@@ -2518,6 +3274,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		currentSessionId = ctx.sessionManager.getSessionId();
 		const loaded = loadHandoffSettings();
 		handoffSettings = loaded.settings;
 		if (loaded.warning) ctx.ui.notify(loaded.warning, "warning");
@@ -2527,12 +3284,17 @@ export default function (pi: ExtensionAPI) {
 		setRelayPersistence({ cwd: ctx.cwd, model: persistence?.cwd === ctx.cwd ? persistence?.model : undefined });
 		if (!readRelay() && event.reason !== "new") {
 			const saved = loadPersistedRelay(relayStatePath(ctx.cwd));
+			const stoppedRecord = readStoppedRelay(ctx.cwd)?.record;
+			const recovered = stoppedRecord ?? (saved && "record" in saved ? saved.record : undefined);
 			// A relay that another live pi process is running is not interrupted.
-			if (saved && "record" in saved && !relayOwnedByOtherProcess(ctx.cwd)) {
-				const r = saved.record.relay;
+			if (recovered && !relayOwnedByOtherProcess(ctx.cwd)) {
+				const r = recovered.relay;
+				const stopped = recovered.stopped;
 				ctx.ui.notify(
-					`A hand-off relay was interrupted at step ${relayStep(r)} of ${r.maxSteps} ($${r.spent.toFixed(2)} spent before that session). \`/hand-off-relay resume\` continues it; \`/hand-off-relay off\` discards it.`,
-					"warning",
+					stopped
+						? `A hand-off relay stopped in session ${r.sessionIds.at(-1)}: ${stopped.reason} Open that session and use \`/hand-off-relay resume\` to reconsider, or \`off\` to discard the snapshot.`
+						: `A hand-off relay was interrupted at step ${relayStep(r)} of ${r.maxSteps} ($${r.spent.toFixed(2)} spent before that session). \`/hand-off-relay resume\` continues it; \`/hand-off-relay off\` discards it.`,
+					stopped ? "info" : "warning",
 				);
 			}
 		}

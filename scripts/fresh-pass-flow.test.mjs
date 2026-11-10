@@ -81,6 +81,7 @@ async function runHandoff({
 			applied.level = level;
 		},
 		getSessionName: () => "flow test",
+		events: { on: () => () => {} },
 	};
 
 	const modelRegistry = {
@@ -94,6 +95,7 @@ async function runHandoff({
 	};
 
 	const replacementCtx = {
+		sessionManager: { getSessionId: () => "replacement-session" },
 		ui: {
 			setEditorText: (value) => {
 				editorText = value;

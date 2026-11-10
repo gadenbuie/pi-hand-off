@@ -102,11 +102,27 @@ Use these commands while a relay is armed:
 
 ```text
 /hand-off-relay status
+/hand-off-relay resume [--max-steps N] [--max-cost USD]
 /hand-off-relay model [provider/model[:level]]
 /hand-off-relay off
 ```
 
-`status` shows the current step, spending, sessions, and which model the next hop will use. `off` disarms the relay.
+`status` shows the current state, step, spending, sessions, outstanding background tasks when known, and which model the next hop will use. `resume` continues an idle, paused, stopped, or interrupted relay, or retries a failed hand-off. `off` stops an active relay but preserves a recovery snapshot; using `off` on that stopped snapshot discards it. The agent is told that the old protocol is no longer active until the relay is resumed or replaced.
+
+### Relay states and background work
+
+A relay does not treat every idle agent as finished:
+
+- **Waiting for background work:** with `pi-subagents`, the relay tracks outstanding agents and waits until each result is delivered in a notification or read with the result tool/RPC. An unrelated turn cannot discard a pending result. If delivery is lost, `resume` releases a completed-result wait; it does not skip agents that are still running. Other notification systems use the generic no-signal behavior below.
+- **Idle without a signal:** if the agent ends without a hand-off tag and no precise background-result guard is active, the relay stays armed. Any later notification or reply lets it continue; use `resume` to ask for a signal immediately.
+- **Waiting for you:** an explicit pause waits for your reply or `resume`. Unrelated notifications do not advance the relay.
+- **Needs attention:** after repeated malformed tags, or when session replacement fails, the relay preserves its state. Reply with guidance or use `resume`; a failed hand-off is retried from its saved prompt.
+- **Advancing:** a valid hand-off is starting the next session. Use `off` to cancel it; the pending prompt remains recoverable with `resume`.
+- **Stopped:** autonomy is off, but the snapshot remains. Use `resume` in the session where it stopped to reconsider a model's `done` or `stop`, recover from an error, or continue after cancellation. Use `off` to discard the snapshot instead.
+
+Agents are told not to use pause, stop, or done merely because they are waiting for a subagent. Without a background-work integration, the relay cannot prove that work is outstanding, so this instruction matters: the generic fallback handles a turn with **no** signal, not an explicit terminal one.
+
+The [relay lifecycle diagram](docs/relay-lifecycle.md) maps every state to its transitions and recovery actions.
 
 ### Switching models between hops
 
@@ -121,7 +137,9 @@ The current agent keeps its own model and prompt cache — nothing changes mid-t
 
 A staged model that has lost its auth or is no longer available is dropped with a warning at hop time, and the relay falls back to the model it was running.
 
-The relay stops when the work is complete, an agent reports it cannot continue, a limit is reached, or a run is aborted or fails to finish cleanly. If an agent needs your answer, the relay pauses in that session; reply there to let it continue. You get a notification when the relay stops, including the reason and total reported cost. You can revisit its sessions with pi's `/resume` command.
+The relay stops when the work is complete, an agent reports it cannot continue, a limit is reached, or a run is aborted or fails to finish cleanly. Missing or malformed hand-off tags no longer stop it: a missing tag stays idle, while a malformed tag gets one correction request before the relay asks for your attention. If an agent needs your answer, the relay pauses in that session; reply there or use `/hand-off-relay resume` to continue.
+
+You get a notification when the relay stops, including the reason and total reported cost. Stop and `off` also leave a model-visible message so the agent knows the old relay protocol is no longer active. **A stopped relay is recoverable:** open its last session with pi's `/resume` if necessary, then use `/hand-off-relay resume` to reconsider the stop and continue. A step- or cost-limit stop requires a higher limit, for example `resume --max-steps 12` or `resume --max-cost 10`. Using `/hand-off-relay off` on the stopped snapshot discards it instead.
 
 ### Spending limits
 
@@ -129,19 +147,19 @@ With `--max-cost`, agents are nudged after tool turns as reported spending cross
 
 **The limit can be exceeded:** costs are reported after model calls, so one expensive call can overshoot. Models that don't report cost cannot be limited this way. Without `--max-cost`, there is no spending limit.
 
-### Resume after quitting or a crash
+### Resume stopped or interrupted relays
 
-Relay progress is saved locally. When you next start pi in the same working directory, it tells you if a relay was interrupted. To continue it, run:
+Relay progress and stopped snapshots are saved locally. When you next start pi in the same working directory, it tells you if a relay was stopped or interrupted. To continue it, run:
 
 ```text
 /hand-off-relay resume
 ```
 
-If the interruption happened between agents, the next session starts from the saved hand-off. If it happened during a step, first open that session with `/resume`, then run `/hand-off-relay resume`. Use `/hand-off-relay off` to discard an interrupted relay instead.
+If recovery involves a pending hand-off, the next session starts from the saved prompt. Otherwise, first open the relay's last session with `/resume`, then run `/hand-off-relay resume`. If pi reports that an earlier prompt send may still be in preflight, wait for it to finish; if it is stuck, restart pi before resuming so the prompt cannot be submitted twice. Background-task tracking from the old process is not restored; the agent is told to inspect unfinished work instead of assuming its result. Use `/hand-off-relay off` to discard the stopped or interrupted snapshot instead.
 
-Only one relay can run per working directory. If another pi process owns it, `status` identifies that process and you can't resume, discard, or replace its relay until that process stops.
+Only one active relay can run per working directory. If another pi process owns one, `status` identifies that process and you can't resume, discard, or replace it until that process stops. A stopped snapshot has no active process owner and does not block a new relay.
 
-Saved relay files live in `<agent-dir>/pi-hand-off/relays/` and are removed when the relay stops. They include hand-off text, which may contain details from your task.
+Saved relay files live in `<agent-dir>/pi-hand-off/relays/`. They remain after a stop for recovery and are removed when discarded or replaced by another relay. They include hand-off text, which may contain details from your task.
 
 ## Optional configuration
 
